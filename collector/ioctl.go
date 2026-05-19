@@ -642,7 +642,7 @@ type devInfoArgs struct {
 	Unused     [3016]byte
 }
 
-// DevIDMap builds devid→device-name mapping via DEV_INFO ioctl + sysfs size matching
+// DevIDMap builds devid→device-name mapping via BTRFS_IOC_DEV_INFO (path at offset 3072)
 func DevIDMap(mountpoint string, uuid string) map[string]string {
 	result := map[string]string{}
 
@@ -652,31 +652,6 @@ func DevIDMap(mountpoint string, uuid string) map[string]string {
 	}
 	defer f.Close()
 
-	// Get all device names from sysfs
-	devicesDir := fmt.Sprintf("/sys/fs/btrfs/%s/devices", uuid)
-	entries, err := os.ReadDir(devicesDir)
-	if err != nil {
-		return result
-	}
-
-	// Build size→name map from sysfs
-	type devEntry struct {
-		name  string
-		bytes uint64
-	}
-	var devList []devEntry
-	for _, e := range entries {
-		sizePath := filepath.Join("/sys/block", e.Name(), "size")
-		sizeData, err := os.ReadFile(sizePath)
-		if err != nil {
-			continue
-		}
-		var sizeBlocks uint64
-		fmt.Sscanf(strings.TrimSpace(string(sizeData)), "%d", &sizeBlocks)
-		devList = append(devList, devEntry{name: e.Name(), bytes: sizeBlocks * 512})
-	}
-
-	// Query devids via ioctl and match by total_bytes
 	for devid := uint64(0); devid < 256; devid++ {
 		var args devInfoArgs
 		args.DevID = devid
@@ -686,22 +661,15 @@ func DevIDMap(mountpoint string, uuid string) map[string]string {
 		}
 
 		key := fmt.Sprintf("%d", devid)
-		if args.TotalBytes == 0 {
-			result[key] = "missing"
-			continue
-		}
+		// Path is at the end of the struct (offset 3072 in the 4096-byte struct)
+		pathBytes := (*[1024]byte)(unsafe.Pointer(uintptr(unsafe.Pointer(&args)) + 3072))
+		path := strings.TrimRight(string(pathBytes[:]), "\x00")
+		path = strings.TrimSpace(path)
 
-		matched := false
-		for i, d := range devList {
-			if d.bytes == args.TotalBytes {
-				result[key] = d.name
-				devList = append(devList[:i], devList[i+1:]...)
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			result[key] = fmt.Sprintf("devid-%d", devid)
+		if path == "" {
+			result[key] = "missing"
+		} else {
+			result[key] = filepath.Base(path) // e.g. "dm-8" from "/dev/dm-8"
 		}
 	}
 

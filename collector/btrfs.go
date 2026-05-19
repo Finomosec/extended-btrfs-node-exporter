@@ -730,6 +730,7 @@ func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS,
 	devinfoBase := fmt.Sprintf("/sys/fs/btrfs/%s/devinfo", fs.UUID)
 	devinfos, _ := os.ReadDir(devinfoBase)
 	devMap := DevIDMap(fs.Mountpoint, fs.UUID)
+	log.Printf("[%s] DevIDMap: %v", fs.Mountpoint, devMap)
 	for _, di := range devinfos {
 		rtData, _ := os.ReadFile(filepath.Join(devinfoBase, di.Name(), "replace_target"))
 		if strings.TrimSpace(string(rtData)) == "1" {
