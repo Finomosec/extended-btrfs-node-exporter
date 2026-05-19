@@ -183,6 +183,7 @@ type btrfsFS struct {
 	UUID       string
 	Mountpoint string
 	Devices    []string
+	fd         int // shared file descriptor for ioctls
 }
 
 // discoverFilesystems finds all mounted btrfs filesystems via /proc/self/mounts
@@ -265,6 +266,15 @@ func uuidForDevice(dev string) string {
 func (c *BtrfsCollector) collectFS(ch chan<- prometheus.Metric, fs btrfsFS) {
 	labels := []string{fs.UUID, fs.Mountpoint}
 
+	// Open a single fd for all ioctls on this filesystem
+	fd, err := syscall.Open(fs.Mountpoint, syscall.O_RDONLY, 0)
+	if err != nil {
+		log.Printf("[%s] open: %v", fs.Mountpoint, err)
+		return
+	}
+	defer syscall.Close(fd)
+	fs.fd = fd
+
 	// All collectors use timeouts to prevent blocking on kernel locks
 	c.collectDfMetrics(ch, fs, labels)
 	c.collectExclusiveOp(ch, fs, labels)
@@ -277,7 +287,7 @@ func (c *BtrfsCollector) collectFS(ch chan<- prometheus.Metric, fs btrfsFS) {
 	var subvols []SubvolInfo
 	if c.cfg.CollectSubvolumes || c.cfg.CollectQgroups {
 		var err error
-		subvols, err = ListSubvolumes(fs.Mountpoint, c.cfg.IoctlTimeout)
+		subvols, err = ListSubvolumes(fs.fd, fs.Mountpoint, c.cfg.IoctlTimeout)
 		if err != nil {
 			log.Printf("[%s] ListSubvolumes: %v", fs.Mountpoint, err)
 		}
@@ -347,7 +357,7 @@ func (c *BtrfsCollector) emitSubvolGenerations(ch chan<- prometheus.Metric, fs b
 // collectQgroups reads qgroup data via BTRFS_IOC_TREE_SEARCH on quota tree (no subprocess)
 // Uses pre-fetched subvols list to filter and annotate qgroups
 func (c *BtrfsCollector) collectQgroups(ch chan<- prometheus.Metric, fs btrfsFS, labels []string, subvols []SubvolInfo) {
-	qgroups, err := ListQgroups(fs.Mountpoint, c.cfg.IoctlTimeout)
+	qgroups, err := ListQgroups(fs.fd, fs.Mountpoint, c.cfg.IoctlTimeout)
 	if err != nil {
 		log.Printf("[%s] collectQgroups: %v", fs.Mountpoint, err)
 		return
@@ -699,7 +709,7 @@ func (c *BtrfsCollector) collectDefrag(ch chan<- prometheus.Metric, fs btrfsFS, 
 
 // collectQuotaRescan uses BTRFS_IOC_QUOTA_RESCAN_STATUS (no subprocess)
 func (c *BtrfsCollector) collectQuotaRescan(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
-	status, err := GetQuotaRescanStatus(fs.Mountpoint, c.cfg.IoctlTimeout)
+	status, err := GetQuotaRescanStatus(fs.fd, fs.Mountpoint, c.cfg.IoctlTimeout)
 	if err != nil || status == nil {
 		ch <- prometheus.MustNewConstMetric(c.quotaRescanRunning, prometheus.GaugeValue, 0, labels...)
 		ch <- prometheus.MustNewConstMetric(c.quotaRescanKey, prometheus.CounterValue, 0, labels...)
@@ -715,7 +725,7 @@ func (c *BtrfsCollector) collectQuotaRescan(ch chan<- prometheus.Metric, fs btrf
 
 // collectReplace uses BTRFS_IOC_DEV_REPLACE for status (no subprocess)
 func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
-	status, err := GetReplaceStatus(fs.Mountpoint, c.cfg.IoctlTimeout)
+	status, err := GetReplaceStatus(fs.fd, fs.Mountpoint, c.cfg.IoctlTimeout)
 	if err != nil || status == nil || !status.Running {
 		return
 	}
@@ -729,7 +739,7 @@ func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS,
 	oldDev := "MISSING"
 	devinfoBase := fmt.Sprintf("/sys/fs/btrfs/%s/devinfo", fs.UUID)
 	devinfos, _ := os.ReadDir(devinfoBase)
-	devMap := DevIDMap(fs.Mountpoint, fs.UUID)
+	devMap := DevIDMap(fs.fd, fs.Mountpoint, fs.UUID)
 	log.Printf("[%s] DevIDMap: %v", fs.Mountpoint, devMap)
 	for _, di := range devinfos {
 		rtData, _ := os.ReadFile(filepath.Join(devinfoBase, di.Name(), "replace_target"))
@@ -758,7 +768,7 @@ func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS,
 
 // collectBalance uses BTRFS_IOC_BALANCE_PROGRESS (no subprocess)
 func (c *BtrfsCollector) collectBalance(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
-	status, err := GetBalanceStatus(fs.Mountpoint, c.cfg.IoctlTimeout)
+	status, err := GetBalanceStatus(fs.fd, fs.Mountpoint, c.cfg.IoctlTimeout)
 	if err != nil || status == nil || !status.Running {
 		return
 	}
@@ -823,7 +833,7 @@ func (c *BtrfsCollector) collectBees(ch chan<- prometheus.Metric, fs btrfsFS, la
 // collectOrphans counts orphan (deleted but not yet cleaned) subvolumes via `btrfs subvolume list -d`
 // Tracks max value in a state file to show peak orphan count
 func (c *BtrfsCollector) collectOrphans(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
-	count, err := CountOrphans(fs.Mountpoint, c.cfg.IoctlTimeout)
+	count, err := CountOrphans(fs.fd, fs.Mountpoint, c.cfg.IoctlTimeout)
 	if err != nil {
 		ch <- prometheus.MustNewConstMetric(c.cleanOrphansLeft, prometheus.GaugeValue, 0, labels...)
 		ch <- prometheus.MustNewConstMetric(c.cleanOrphansMax, prometheus.GaugeValue, 0, labels...)

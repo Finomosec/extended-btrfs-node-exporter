@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
-	"os"
+	
 	"path/filepath"
 	"strings"
 	"sync"
@@ -150,19 +150,14 @@ type SubvolInfo struct {
 }
 
 // ListSubvolumes lists all subvolumes using BTRFS_IOC_TREE_SEARCH
-func ListSubvolumes(mountpoint string, timeout time.Duration) ([]SubvolInfo, error) {
+func ListSubvolumes(fd int, mountpoint string, timeout time.Duration) ([]SubvolInfo, error) {
 	return withTimeout(mountpoint+":subvols", timeout, func() ([]SubvolInfo, error) {
-		return listSubvolumesImpl(mountpoint)
+		return listSubvolumesImpl(fd, mountpoint)
 	})
 }
 
-func listSubvolumesImpl(mountpoint string) ([]SubvolInfo, error) {
-	f, err := os.Open(mountpoint)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	fd := f.Fd()
+func listSubvolumesImpl(fd int, mountpoint string) ([]SubvolInfo, error) {
+	
 
 	var result []SubvolInfo
 	backrefs := map[uint64]struct{ parentID uint64; name string }{}
@@ -181,7 +176,7 @@ func listSubvolumesImpl(mountpoint string) ([]SubvolInfo, error) {
 
 	for {
 		args.Key.NrItems = 4096
-		nr, err := doTreeSearch(fd, &args)
+		nr, err := doTreeSearch(uintptr(fd), &args)
 		if err != nil {
 			return result, err
 		}
@@ -278,8 +273,6 @@ func buildPath(id uint64, backrefs map[uint64]struct{ parentID uint64; name stri
 	}
 	return path
 }
-
-
 // IsNullUUID checks if a UUID is all zeros
 func IsNullUUID(uuid [16]byte) bool {
 	for _, b := range uuid {
@@ -299,19 +292,14 @@ type QgroupInfo struct {
 }
 
 // ListQgroups reads qgroup info via BTRFS_IOC_TREE_SEARCH on the quota tree
-func ListQgroups(mountpoint string, timeout time.Duration) ([]QgroupInfo, error) {
+func ListQgroups(fd int, mountpoint string, timeout time.Duration) ([]QgroupInfo, error) {
 	return withTimeout(mountpoint+":qgroups", timeout, func() ([]QgroupInfo, error) {
-		return listQgroupsImpl(mountpoint)
+		return listQgroupsImpl(fd, mountpoint)
 	})
 }
 
-func listQgroupsImpl(mountpoint string) ([]QgroupInfo, error) {
-	f, err := os.Open(mountpoint)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	fd := f.Fd()
+func listQgroupsImpl(fd int, mountpoint string) ([]QgroupInfo, error) {
+	
 
 	var result []QgroupInfo
 	var args searchArgs
@@ -327,7 +315,7 @@ func listQgroupsImpl(mountpoint string) ([]QgroupInfo, error) {
 	args.Key.NrItems = 4096
 
 	for iterations := 0; iterations < 10000; iterations++ {
-		nr, err := doTreeSearch(fd, &args)
+		nr, err := doTreeSearch(uintptr(fd), &args)
 		if err != nil {
 			return result, err
 		}
@@ -378,19 +366,14 @@ func listQgroupsImpl(mountpoint string) ([]QgroupInfo, error) {
 // --- Orphan Items ---
 
 // CountOrphans counts orphan subvolume items via BTRFS_IOC_TREE_SEARCH
-func CountOrphans(mountpoint string, timeout time.Duration) (int, error) {
+func CountOrphans(fd int, mountpoint string, timeout time.Duration) (int, error) {
 	return withTimeout(mountpoint+":orphans", timeout, func() (int, error) {
-		return countOrphansImpl(mountpoint)
+		return countOrphansImpl(fd, mountpoint)
 	})
 }
 
-func countOrphansImpl(mountpoint string) (int, error) {
-	f, err := os.Open(mountpoint)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	fd := f.Fd()
+func countOrphansImpl(fd int, mountpoint string) (int, error) {
+	
 
 	count := 0
 	var args searchArgs
@@ -406,7 +389,7 @@ func countOrphansImpl(mountpoint string) (int, error) {
 	args.Key.NrItems = 4096
 
 	for iterations := 0; iterations < 10000; iterations++ {
-		nr, err := doTreeSearch(fd, &args)
+		nr, err := doTreeSearch(uintptr(fd), &args)
 		if err != nil || nr == 0 {
 			break
 		}
@@ -461,25 +444,19 @@ type ReplaceStatus struct {
 }
 
 // GetReplaceStatus queries device replace status via ioctl
-func GetReplaceStatus(mountpoint string, timeout time.Duration) (*ReplaceStatus, error) {
+func GetReplaceStatus(fd int, mountpoint string, timeout time.Duration) (*ReplaceStatus, error) {
 	return withTimeout(mountpoint+":replace", timeout, func() (*ReplaceStatus, error) {
-		return getReplaceStatusImpl(mountpoint)
+		return getReplaceStatusImpl(fd, mountpoint)
 	})
 }
 
-func getReplaceStatusImpl(mountpoint string) (*ReplaceStatus, error) {
-	f, err := os.Open(mountpoint)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
+func getReplaceStatusImpl(fd int, mountpoint string) (*ReplaceStatus, error) {
 
 	var args devReplaceArgs
 	args.Cmd = devReplaceCmdStatus
 
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), iocDevReplace, uintptr(unsafe.Pointer(&args)))
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), iocDevReplace, uintptr(unsafe.Pointer(&args)))
 	if errno != 0 {
-		return nil, errno
 	}
 
 	if args.Result != 0 { // BTRFS_IOCTL_DEV_REPLACE_RESULT_NO_ERROR = 0
@@ -556,23 +533,17 @@ type BalanceStatus struct {
 }
 
 // GetBalanceStatus queries balance progress via ioctl
-func GetBalanceStatus(mountpoint string, timeout time.Duration) (*BalanceStatus, error) {
+func GetBalanceStatus(fd int, mountpoint string, timeout time.Duration) (*BalanceStatus, error) {
 	return withTimeout(mountpoint+":balance", timeout, func() (*BalanceStatus, error) {
-		return getBalanceStatusImpl(mountpoint)
+		return getBalanceStatusImpl(fd, mountpoint)
 	})
 }
 
-func getBalanceStatusImpl(mountpoint string) (*BalanceStatus, error) {
-	f, err := os.Open(mountpoint)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
+func getBalanceStatusImpl(fd int, mountpoint string) (*BalanceStatus, error) {
 
 	var args balanceArgs
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), iocBalanceProgress, uintptr(unsafe.Pointer(&args)))
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), iocBalanceProgress, uintptr(unsafe.Pointer(&args)))
 	if errno != 0 {
-		return nil, errno
 	}
 
 	state := "running"
@@ -606,21 +577,16 @@ type QuotaRescanStatus struct {
 }
 
 // GetQuotaRescanStatus queries quota rescan status via ioctl
-func GetQuotaRescanStatus(mountpoint string, timeout time.Duration) (*QuotaRescanStatus, error) {
+func GetQuotaRescanStatus(fd int, mountpoint string, timeout time.Duration) (*QuotaRescanStatus, error) {
 	return withTimeout(mountpoint+":rescan", timeout, func() (*QuotaRescanStatus, error) {
-		return getQuotaRescanStatusImpl(mountpoint)
+		return getQuotaRescanStatusImpl(fd, mountpoint)
 	})
 }
 
-func getQuotaRescanStatusImpl(mountpoint string) (*QuotaRescanStatus, error) {
-	f, err := os.Open(mountpoint)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
+func getQuotaRescanStatusImpl(fd int, mountpoint string) (*QuotaRescanStatus, error) {
 
 	var args quotaRescanArgs
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), iocQuotaRescanStatus, uintptr(unsafe.Pointer(&args)))
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), iocQuotaRescanStatus, uintptr(unsafe.Pointer(&args)))
 	if errno != 0 {
 		return &QuotaRescanStatus{Running: false}, nil
 	}
@@ -640,30 +606,34 @@ type devInfoArgs struct {
 	TotalBytes uint64
 	FsID       [16]byte
 	Unused     [3016]byte
-}
+	Path       [1024]byte
+} // 4096 bytes total
+
+// devIDMapCache caches device mappings — they don't change at runtime
+var devIDMapCache = map[string]map[string]string{}
+var devIDMapCacheMu sync.Mutex
 
 // DevIDMap builds devid→device-name mapping via BTRFS_IOC_DEV_INFO (path at offset 3072)
-func DevIDMap(mountpoint string, uuid string) map[string]string {
-	result := map[string]string{}
-
-	f, err := os.Open(mountpoint)
-	if err != nil {
-		return result
+func DevIDMap(fd int, mountpoint string, uuid string) map[string]string {
+	devIDMapCacheMu.Lock()
+	if cached, ok := devIDMapCache[uuid]; ok {
+		devIDMapCacheMu.Unlock()
+		return cached
 	}
-	defer f.Close()
+	devIDMapCacheMu.Unlock()
+
+	result := map[string]string{}
 
 	for devid := uint64(0); devid < 256; devid++ {
 		var args devInfoArgs
 		args.DevID = devid
-		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), iocDevInfo, uintptr(unsafe.Pointer(&args)))
+		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), iocDevInfo, uintptr(unsafe.Pointer(&args)))
 		if errno != 0 {
 			continue
 		}
 
 		key := fmt.Sprintf("%d", devid)
-		// Path is at the end of the struct (offset 3072 in the 4096-byte struct)
-		pathBytes := (*[1024]byte)(unsafe.Pointer(uintptr(unsafe.Pointer(&args)) + 3072))
-		path := strings.TrimRight(string(pathBytes[:]), "\x00")
+		path := strings.TrimRight(string(args.Path[:]), "\x00")
 		path = strings.TrimSpace(path)
 
 		if path == "" {
@@ -671,6 +641,12 @@ func DevIDMap(mountpoint string, uuid string) map[string]string {
 		} else {
 			result[key] = filepath.Base(path) // e.g. "dm-8" from "/dev/dm-8"
 		}
+	}
+
+	if len(result) > 0 {
+		devIDMapCacheMu.Lock()
+		devIDMapCache[uuid] = result
+		devIDMapCacheMu.Unlock()
 	}
 
 	return result
