@@ -294,6 +294,9 @@ func (c *BtrfsCollector) collectFS(ch chan<- prometheus.Metric, fs btrfsFS) {
 	if c.cfg.CollectBees {
 		c.collectBees(ch, fs, labels)
 	}
+	if c.cfg.CollectOrphans {
+		c.collectOrphans(ch, fs, labels)
+	}
 }
 
 // collectDfMetrics reads filesystem space via statfs syscall (no subprocess)
@@ -735,7 +738,46 @@ func (c *BtrfsCollector) collectBees(ch chan<- prometheus.Metric, fs btrfsFS, la
 	}
 }
 
-// resolveDeviceName resolves dm-X to /dev/mapper/luks-* if UseLuksDeviceNames is enabled
+// collectOrphans counts orphan (deleted but not yet cleaned) subvolumes via `btrfs subvolume list -d`
+// Tracks max value in a state file to show peak orphan count
+func (c *BtrfsCollector) collectOrphans(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
+	out, err := exec.Command("btrfs", "subvolume", "list", "-d", fs.Mountpoint).Output()
+	if err != nil {
+		ch <- prometheus.MustNewConstMetric(c.cleanOrphansLeft, prometheus.GaugeValue, 0, labels...)
+		ch <- prometheus.MustNewConstMetric(c.cleanOrphansMax, prometheus.GaugeValue, 0, labels...)
+		return
+	}
+
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.TrimSpace(line) != "" {
+			count++
+		}
+	}
+
+	// Track max via state file
+	stateDir := "/tmp"
+	statePath := filepath.Join(stateDir, fs.UUID+".max")
+	storedMax := 0
+	if data, err := os.ReadFile(statePath); err == nil {
+		storedMax, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+	}
+
+	newMax := storedMax
+	if count == 0 {
+		newMax = 0
+	} else if count > storedMax {
+		newMax = count
+	}
+	if newMax != storedMax {
+		os.WriteFile(statePath, []byte(strconv.Itoa(newMax)), 0644)
+	}
+
+	ch <- prometheus.MustNewConstMetric(c.cleanOrphansLeft, prometheus.GaugeValue, float64(count), labels...)
+	ch <- prometheus.MustNewConstMetric(c.cleanOrphansMax, prometheus.GaugeValue, float64(newMax), labels...)
+}
+
+// resolveDeviceName resolves dm-X to /dev/mapper/* if ResolveDeviceMapper is enabled
 func (c *BtrfsCollector) resolveDeviceName(dmName string) string {
 	if !c.cfg.ResolveDeviceMapper {
 		return dmName
