@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 
 	"github.com/Finomosec/extended-btrfs-node-exporter/collector"
@@ -26,7 +27,10 @@ func main() {
 	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html><head><title>Extended BTRFS Exporter</title></head>
-		<body><h1>Extended BTRFS Exporter</h1><p><a href="/metrics">Metrics</a></p></body></html>`))
+		<body><h1>Extended BTRFS Exporter</h1>
+		<p><a href="/metrics">Metrics</a></p>
+		<p><a href="/debug/pprof/">Profiler</a></p>
+		</body></html>`))
 	})
 
 	log.Printf("Extended BTRFS Exporter listening on :%s", port)

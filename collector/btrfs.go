@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -266,20 +265,29 @@ func uuidForDevice(dev string) string {
 func (c *BtrfsCollector) collectFS(ch chan<- prometheus.Metric, fs btrfsFS) {
 	labels := []string{fs.UUID, fs.Mountpoint}
 
-	// Always collect filesystem-level df metrics
+	// All collectors use timeouts to prevent blocking on kernel locks
 	c.collectDfMetrics(ch, fs, labels)
 	c.collectExclusiveOp(ch, fs, labels)
 
-	if c.cfg.CollectSubvolumes {
-		c.collectSubvolumes(ch, fs, labels)
-	}
-	if c.cfg.CollectQgroups {
-		c.collectQgroups(ch, fs, labels)
-		c.collectQuotaRescan(ch, fs, labels)
-	}
 	if c.cfg.CollectCommit {
 		c.collectCommitStats(ch, fs, labels)
 		c.collectCommitRunning(ch, fs, labels)
+	}
+	// Fetch subvolume list once, share between collectors
+	var subvols []SubvolInfo
+	if c.cfg.CollectSubvolumes || c.cfg.CollectQgroups {
+		var err error
+		subvols, err = ListSubvolumes(fs.Mountpoint, c.cfg.IoctlTimeout)
+		if err != nil {
+			log.Printf("[%s] ListSubvolumes: %v", fs.Mountpoint, err)
+		}
+	}
+	if c.cfg.CollectSubvolumes && subvols != nil {
+		c.emitSubvolGenerations(ch, fs, subvols)
+	}
+	if c.cfg.CollectQgroups {
+		c.collectQgroups(ch, fs, labels, subvols)
+		c.collectQuotaRescan(ch, fs, labels)
 	}
 	if c.cfg.CollectDefrag {
 		c.collectDefrag(ch, fs, labels)
@@ -298,6 +306,15 @@ func (c *BtrfsCollector) collectFS(ch chan<- prometheus.Metric, fs btrfsFS) {
 	}
 }
 
+// readExclusiveOp reads the current exclusive operation from sysfs (never blocks)
+func readExclusiveOp(uuid string) string {
+	data, err := os.ReadFile(fmt.Sprintf("/sys/fs/btrfs/%s/exclusive_operation", uuid))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
 // collectDfMetrics reads filesystem space via statfs syscall (no subprocess)
 func (c *BtrfsCollector) collectDfMetrics(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
 	var stat syscall.Statfs_t
@@ -314,133 +331,58 @@ func (c *BtrfsCollector) collectDfMetrics(ch chan<- prometheus.Metric, fs btrfsF
 	ch <- prometheus.MustNewConstMetric(c.freeBytes, prometheus.GaugeValue, float64(free), labels...)
 }
 
-// collectSubvolumes reads subvolume list and generation via btrfs ioctl
-// Falls back to `btrfs subvolume list -t` if ioctl not available
-func (c *BtrfsCollector) collectSubvolumes(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
-	// Get root subvolume generation
-	rootGen := readRootGeneration(fs.Mountpoint)
-	if rootGen > 0 {
-		ch <- prometheus.MustNewConstMetric(c.subvolGenerations, prometheus.CounterValue, float64(rootGen),
-			fs.UUID, fs.Mountpoint, ".", "5")
+// emitSubvolGenerations emits generation metrics for subvolumes
+func (c *BtrfsCollector) emitSubvolGenerations(ch chan<- prometheus.Metric, fs btrfsFS, subvols []SubvolInfo) {
+	for _, sv := range subvols {
+		isSnapshot := !IsNullUUID(sv.ParentUUID)
+		if !c.cfg.ShouldCollectSubvol(sv.Path, isSnapshot) {
+			continue
+		}
+		subvolID := fmt.Sprintf("%d", sv.ID)
+		ch <- prometheus.MustNewConstMetric(c.subvolGenerations, prometheus.CounterValue, float64(sv.Generation),
+			fs.UUID, fs.Mountpoint, sv.Path, subvolID)
 	}
+}
 
-	// Use btrfs subvolume list with parent_uuid to detect snapshots
-	out, err := exec.Command("btrfs", "subvolume", "list", "-tupq", fs.Mountpoint).Output()
+// collectQgroups reads qgroup data via BTRFS_IOC_TREE_SEARCH on quota tree (no subprocess)
+// Uses pre-fetched subvols list to filter and annotate qgroups
+func (c *BtrfsCollector) collectQgroups(ch chan<- prometheus.Metric, fs btrfsFS, labels []string, subvols []SubvolInfo) {
+	qgroups, err := ListQgroups(fs.Mountpoint, c.cfg.IoctlTimeout)
 	if err != nil {
-		log.Printf("btrfs subvolume list %s: %v", fs.Mountpoint, err)
+		log.Printf("[%s] collectQgroups: %v", fs.Mountpoint, err)
 		return
 	}
 
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		if strings.HasPrefix(line, "ID") || strings.HasPrefix(line, "--") || strings.TrimSpace(line) == "" {
-			continue
+	// Build lookup maps from pre-fetched subvolume list
+	snapSet := map[uint64]bool{}
+	pathMap := map[uint64]string{5: "."}
+	for _, sv := range subvols {
+		pathMap[sv.ID] = sv.Path
+		if !IsNullUUID(sv.ParentUUID) {
+			snapSet[sv.ID] = true
 		}
-		// Tab-separated: ID gen parent top_level (empty) parent_uuid uuid path
-		// Note: field[4] is always empty (double-tab), parent_uuid is field[5]
-		fields := strings.Split(line, "\t")
-		if len(fields) < 8 {
-			continue
-		}
-		subvolID := strings.TrimSpace(fields[0])
-		gen := strings.TrimSpace(fields[1])
-		parentUUID := strings.TrimSpace(fields[5])
-		path := strings.TrimSpace(fields[len(fields)-1])
+	}
 
-		isSnapshot := parentUUID != "" && parentUUID != "-" && !strings.HasPrefix(parentUUID, "-")
+	emitted := 0
+	for _, qg := range qgroups {
+		path := pathMap[qg.SubvolID]
+		if path == "" {
+			continue // stale qgroup — subvolume deleted
+		}
+
+		isSnapshot := snapSet[qg.SubvolID]
 		if !c.cfg.ShouldCollectSubvol(path, isSnapshot) {
 			continue
 		}
 
-		genVal, _ := strconv.ParseFloat(gen, 64)
-		ch <- prometheus.MustNewConstMetric(c.subvolGenerations, prometheus.CounterValue, genVal,
-			fs.UUID, fs.Mountpoint, path, subvolID)
-	}
-}
-
-// readRootGeneration reads the generation of the root subvolume via btrfs subvolume show
-func readRootGeneration(mountpoint string) uint64 {
-	out, err := exec.Command("btrfs", "subvolume", "show", mountpoint).Output()
-	if err != nil {
-		return 0
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "Generation:") {
-			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				v, _ := strconv.ParseUint(parts[1], 10, 64)
-				return v
-			}
-		}
-	}
-	return 0
-}
-
-// snapshotIDs returns a set of subvolume IDs that are snapshots (have parent_uuid)
-func snapshotIDs(mountpoint string) map[string]bool {
-	result := map[string]bool{}
-	out, err := exec.Command("btrfs", "subvolume", "list", "-tupq", mountpoint).Output()
-	if err != nil {
-		return result
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Split(line, "\t")
-		if len(fields) < 8 {
-			continue
-		}
-		subvolID := strings.TrimSpace(fields[0])
-		parentUUID := strings.TrimSpace(fields[5])
-		if parentUUID != "" && parentUUID != "-" && !strings.HasPrefix(parentUUID, "-") {
-			result[subvolID] = true
-		}
-	}
-	return result
-}
-
-// collectQgroups reads qgroup data via `btrfs qgroup show`
-func (c *BtrfsCollector) collectQgroups(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
-	out, err := exec.Command("btrfs", "qgroup", "show", "--raw", fs.Mountpoint).Output()
-	if err != nil {
-		return // quotas not enabled
-	}
-
-	snapIDs := snapshotIDs(fs.Mountpoint)
-
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "Qgroupid") || strings.HasPrefix(line, "---") {
-			continue
-		}
-		if strings.Contains(line, "<stale>") {
-			continue
-		}
-
-		// Parse: 0/ID  referenced  exclusive  path
-		line = strings.TrimPrefix(line, "0/")
-		fields := strings.Fields(line)
-		if len(fields) < 4 {
-			continue
-		}
-		subvolID := fields[0]
-		referenced, _ := strconv.ParseFloat(fields[1], 64)
-		exclusive, _ := strconv.ParseFloat(fields[2], 64)
-		path := fields[3]
-		if path == "<toplevel>" {
-			path = "."
-		}
-
-		isSnapshot := snapIDs[subvolID]
-		if !c.cfg.ShouldCollectSubvol(path, isSnapshot) {
-			continue
-		}
-
+		subvolID := fmt.Sprintf("%d", qg.SubvolID)
 		subvolLabels := []string{fs.UUID, fs.Mountpoint, path, subvolID}
-		ch <- prometheus.MustNewConstMetric(c.subvolReferenced, prometheus.GaugeValue, referenced, subvolLabels...)
-		ch <- prometheus.MustNewConstMetric(c.subvolExclusive, prometheus.GaugeValue, exclusive, subvolLabels...)
-		ch <- prometheus.MustNewConstMetric(c.subvolDiskUsage, prometheus.GaugeValue, exclusive, subvolLabels...)
+		ch <- prometheus.MustNewConstMetric(c.subvolReferenced, prometheus.GaugeValue, float64(qg.Referenced), subvolLabels...)
+		ch <- prometheus.MustNewConstMetric(c.subvolExclusive, prometheus.GaugeValue, float64(qg.Exclusive), subvolLabels...)
+		ch <- prometheus.MustNewConstMetric(c.subvolDiskUsage, prometheus.GaugeValue, float64(qg.Exclusive), subvolLabels...)
+		emitted++
 	}
+	log.Printf("[%s] collectQgroups: %d qgroups read, %d emitted", fs.Mountpoint, len(qgroups), emitted)
 }
 
 // collectCommitStats reads /sys/fs/btrfs/<uuid>/commit_stats (no subprocess)
@@ -561,17 +503,20 @@ func pidStartTime(pid string) float64 {
 	return ticks / clkTck
 }
 
-// mountTimeFromDmesg extracts "first mount" timestamps from dmesg for each UUID
+// mountTimeFromDmesg extracts "first mount" timestamps from kernel log for each UUID
 func mountTimeFromDmesg() map[string]float64 {
 	result := map[string]float64{}
-	data, err := os.ReadFile("/dev/kmsg")
-	if err != nil {
-		// Fallback: try exec dmesg
-		out, err := exec.Command("dmesg").Output()
-		if err != nil {
-			return result
+	// Read kernel log from syslog files (no subprocess)
+	var data []byte
+	for _, path := range []string{"/var/log/kern.log", "/var/log/syslog", "/var/log/dmesg"} {
+		var err error
+		data, err = os.ReadFile(path)
+		if err == nil {
+			break
 		}
-		data = out
+	}
+	if data == nil {
+		return result
 	}
 
 	uuidRe := regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
@@ -752,50 +697,35 @@ func (c *BtrfsCollector) collectDefrag(ch chan<- prometheus.Metric, fs btrfsFS, 
 	ch <- prometheus.MustNewConstMetric(c.defragRunning, prometheus.GaugeValue, float64(count), labels...)
 }
 
-// collectQuotaRescan uses `btrfs quota rescan -s`
+// collectQuotaRescan uses BTRFS_IOC_QUOTA_RESCAN_STATUS (no subprocess)
 func (c *BtrfsCollector) collectQuotaRescan(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
-	out, err := exec.Command("btrfs", "quota", "rescan", "-s", fs.Mountpoint).CombinedOutput()
-	if err != nil {
+	status, err := GetQuotaRescanStatus(fs.Mountpoint, c.cfg.IoctlTimeout)
+	if err != nil || status == nil {
 		ch <- prometheus.MustNewConstMetric(c.quotaRescanRunning, prometheus.GaugeValue, 0, labels...)
 		ch <- prometheus.MustNewConstMetric(c.quotaRescanKey, prometheus.CounterValue, 0, labels...)
 		return
 	}
-
-	s := string(out)
 	running := 0.0
-	if strings.Contains(s, "operation running") {
+	if status.Running {
 		running = 1.0
 	}
 	ch <- prometheus.MustNewConstMetric(c.quotaRescanRunning, prometheus.GaugeValue, running, labels...)
-
-	key := 0.0
-	re := regexp.MustCompile(`current key\s+(\d+)`)
-	if m := re.FindStringSubmatch(s); len(m) > 1 {
-		key, _ = strconv.ParseFloat(m[1], 64)
-	}
-	ch <- prometheus.MustNewConstMetric(c.quotaRescanKey, prometheus.CounterValue, key, labels...)
+	ch <- prometheus.MustNewConstMetric(c.quotaRescanKey, prometheus.CounterValue, float64(status.Progress), labels...)
 }
 
-// collectReplace uses `btrfs replace status -1` and sysfs for device info
+// collectReplace uses BTRFS_IOC_DEV_REPLACE for status (no subprocess)
 func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
-	out, err := exec.Command("btrfs", "replace", "status", "-1", fs.Mountpoint).CombinedOutput()
-	if err != nil {
+	status, err := GetReplaceStatus(fs.Mountpoint, c.cfg.IoctlTimeout)
+	if err != nil || status == nil || !status.Running {
 		return
 	}
 
-	s := string(out)
-	re := regexp.MustCompile(`(\d+\.?\d*)% done, (\d+) write errs, (\d+) uncorr\. read errs`)
-	m := re.FindStringSubmatch(s)
-	if len(m) <= 3 {
-		return
-	}
-
-	progress, _ := strconv.ParseFloat(m[1], 64)
-	writeErrs, _ := strconv.ParseFloat(m[2], 64)
-	readErrs, _ := strconv.ParseFloat(m[3], 64)
+	progress := status.Progress
+	writeErrs := float64(status.WriteErrs)
+	readErrs := float64(status.ReadErrs)
 
 	// Find replace target + missing device via sysfs + device map
-	devMap := devIDMap(fs.Mountpoint)
+	devMap := DevIDMap(fs.Mountpoint, fs.UUID)
 	targetDev := ""
 	missingDev := ""
 	devinfoBase := fmt.Sprintf("/sys/fs/btrfs/%s/devinfo", fs.UUID)
@@ -827,56 +757,27 @@ func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS,
 	ch <- prometheus.MustNewConstMetric(c.replaceReadErrs, prometheus.CounterValue, readErrs, replaceLabels...)
 }
 
-// devIDMap builds a devid→device-name mapping via `btrfs device usage`
-func devIDMap(mountpoint string) map[string]string {
-	result := map[string]string{}
-	out, err := exec.Command("btrfs", "device", "usage", mountpoint).Output()
-	if err != nil {
-		return result
-	}
-	// Parse lines like: /dev/dm-8, ID: 0
-	re := regexp.MustCompile(`^(/dev/\S+|missing),\s+ID:\s+(\d+)`)
-	for _, line := range strings.Split(string(out), "\n") {
-		if m := re.FindStringSubmatch(strings.TrimSpace(line)); len(m) > 2 {
-			dev := m[1]
-			if dev == "missing" {
-				result[m[2]] = "missing"
-			} else {
-				result[m[2]] = filepath.Base(dev)
-			}
-		}
-	}
-	return result
-}
 
-// collectBalance uses `btrfs balance status`
+// collectBalance uses BTRFS_IOC_BALANCE_PROGRESS (no subprocess)
 func (c *BtrfsCollector) collectBalance(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
-	out, err := exec.Command("btrfs", "balance", "status", fs.Mountpoint).CombinedOutput()
-	if err != nil {
+	status, err := GetBalanceStatus(fs.Mountpoint, c.cfg.IoctlTimeout)
+	if err != nil || status == nil || !status.Running {
 		return
 	}
 
-	s := string(out)
-	re := regexp.MustCompile(`(\d+) out of about (\d+) chunks balanced \((\d+) considered\),\s+(\d+)% left`)
-	if m := re.FindStringSubmatch(s); len(m) > 4 {
-		done, _ := strconv.ParseFloat(m[1], 64)
-		total, _ := strconv.ParseFloat(m[2], 64)
-		considered, _ := strconv.ParseFloat(m[3], 64)
-		left, _ := strconv.ParseFloat(m[4], 64)
-
-		ch <- prometheus.MustNewConstMetric(c.balanceChunksDone, prometheus.GaugeValue, done, labels...)
-		ch <- prometheus.MustNewConstMetric(c.balanceChunksTotal, prometheus.GaugeValue, total, labels...)
-		ch <- prometheus.MustNewConstMetric(c.balanceChunksConsidered, prometheus.GaugeValue, considered, labels...)
-		ch <- prometheus.MustNewConstMetric(c.balanceProgressPercent, prometheus.GaugeValue, 100-left, labels...)
-
-		status := "running"
-		if strings.Contains(s, "pause requested") {
-			status = "pausing"
-		} else if strings.Contains(s, "is paused") {
-			status = "paused"
-		}
-		ch <- prometheus.MustNewConstMetric(c.balanceStatus, prometheus.GaugeValue, 1, append(labels, status)...)
+	total := float64(status.Expected)
+	done := float64(status.Completed)
+	considered := float64(status.Considered)
+	progress := 0.0
+	if total > 0 {
+		progress = done / total * 100
 	}
+
+	ch <- prometheus.MustNewConstMetric(c.balanceChunksDone, prometheus.GaugeValue, done, labels...)
+	ch <- prometheus.MustNewConstMetric(c.balanceChunksTotal, prometheus.GaugeValue, total, labels...)
+	ch <- prometheus.MustNewConstMetric(c.balanceChunksConsidered, prometheus.GaugeValue, considered, labels...)
+	ch <- prometheus.MustNewConstMetric(c.balanceProgressPercent, prometheus.GaugeValue, progress, labels...)
+	ch <- prometheus.MustNewConstMetric(c.balanceStatus, prometheus.GaugeValue, 1, append(labels, status.State)...)
 }
 
 // collectBees reads bees status from /run/bees/<uuid>.status
@@ -924,18 +825,11 @@ func (c *BtrfsCollector) collectBees(ch chan<- prometheus.Metric, fs btrfsFS, la
 // collectOrphans counts orphan (deleted but not yet cleaned) subvolumes via `btrfs subvolume list -d`
 // Tracks max value in a state file to show peak orphan count
 func (c *BtrfsCollector) collectOrphans(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
-	out, err := exec.Command("btrfs", "subvolume", "list", "-d", fs.Mountpoint).Output()
+	count, err := CountOrphans(fs.Mountpoint, c.cfg.IoctlTimeout)
 	if err != nil {
 		ch <- prometheus.MustNewConstMetric(c.cleanOrphansLeft, prometheus.GaugeValue, 0, labels...)
 		ch <- prometheus.MustNewConstMetric(c.cleanOrphansMax, prometheus.GaugeValue, 0, labels...)
 		return
-	}
-
-	count := 0
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if strings.TrimSpace(line) != "" {
-			count++
-		}
 	}
 
 	// Track max via state file

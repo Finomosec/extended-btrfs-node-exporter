@@ -2,7 +2,9 @@ package collector
 
 import (
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -16,6 +18,9 @@ type Config struct {
 
 	// Device name display: false = dm-X (raw), true = /dev/mapper/* name (resolved)
 	ResolveDeviceMapper bool
+
+	// Timeout for ioctl calls (protects against kernel lock contention)
+	IoctlTimeout time.Duration
 
 	// Collector modules (all true by default)
 	CollectSubvolumes bool // non-snapshot subvolumes
@@ -34,6 +39,7 @@ func LoadConfig() Config {
 	cfg := Config{
 		BeesStatusDir:     "/run/bees",
 		ResolveDeviceMapper: envBool("RESOLVE_DEVICE_MAPPER", false),
+		IoctlTimeout:       envDuration("IOCTL_TIMEOUT_SECS", 30),
 		CollectSubvolumes:  envBool("COLLECT_SUBVOLUMES", true),
 		CollectSnapshots:  envBool("COLLECT_SNAPSHOTS", true),
 		CollectQgroups:    envBool("COLLECT_QGROUPS", true),
@@ -74,6 +80,18 @@ func splitTrim(s string) []string {
 		}
 	}
 	return result
+}
+
+func envDuration(key string, defaultSecs int) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return time.Duration(defaultSecs) * time.Second
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return time.Duration(defaultSecs) * time.Second
+	}
+	return time.Duration(n) * time.Second
 }
 
 func envBool(key string, defaultVal bool) bool {
