@@ -336,20 +336,19 @@ func listQgroupsImpl(mountpoint string) ([]QgroupInfo, error) {
 		}
 
 		offset := 0
-		var lastOffset uint64
+		var sh searchHeader
 		for i := uint32(0); i < nr; i++ {
-			if offset+int(unsafe.Sizeof(searchHeader{})) > len(args.Buf) {
+			if offset+int(unsafe.Sizeof(sh)) > len(args.Buf) {
 				break
 			}
-			hdr := (*searchHeader)(unsafe.Pointer(&args.Buf[offset]))
-			offset += int(unsafe.Sizeof(searchHeader{}))
-			lastOffset = hdr.Offset
+			sh = *(*searchHeader)(unsafe.Pointer(&args.Buf[offset]))
+			offset += int(unsafe.Sizeof(sh))
 
-			if hdr.Type == qgroupInfoKey && hdr.Len >= 40 {
-				itemData := args.Buf[offset : offset+int(hdr.Len)]
+			if sh.Type == qgroupInfoKey && sh.Len >= 40 {
+				itemData := args.Buf[offset : offset+int(sh.Len)]
 				rfer := binary.LittleEndian.Uint64(itemData[8:16])
 				excl := binary.LittleEndian.Uint64(itemData[24:32])
-				subvolID := hdr.Offset & 0xFFFFFFFFFFFF
+				subvolID := sh.Offset & 0xFFFFFFFFFFFF
 
 				result = append(result, QgroupInfo{
 					SubvolID:   subvolID,
@@ -357,11 +356,19 @@ func listQgroupsImpl(mountpoint string) ([]QgroupInfo, error) {
 					Exclusive:  excl,
 				})
 			}
-			offset += int(hdr.Len)
+			offset += int(sh.Len)
+
+			// Track last key for pagination
+			args.Key.MinObjectID = sh.ObjectID
+			args.Key.MinType = sh.Type
+			args.Key.MinOffset = sh.Offset
 		}
 
-		if lastOffset == ^uint64(0) { break }
-		args.Key.MinOffset = lastOffset + 1
+		// Pagination like btrfs-progs __qgroups_search
+		args.Key.MinOffset++
+		if args.Key.MinOffset == 0 {
+			break // overflow
+		}
 		args.Key.NrItems = 4096
 	}
 
