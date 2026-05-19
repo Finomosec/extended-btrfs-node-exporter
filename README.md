@@ -9,8 +9,7 @@ Auto-discovers all mounted btrfs filesystems. Modular collectors can be individu
 - **Linux** with btrfs filesystems
 - **Go 1.23+** (for building)
 - **Root access** (required for btrfs ioctls, sysfs, and `/proc` access)
-- **btrfs-progs** installed (`btrfs` command available in PATH) — *temporary dependency, will be replaced by native ioctls*
-- **Kernel 6.11+** recommended for reliable simple quota accounting (6.17+ ideal)
+- **Kernel 6.8+** (btrfs sysfs interface required)
 
 ### Optional
 
