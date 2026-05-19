@@ -179,18 +179,18 @@ The exporter reads from these sources (no external scripts required):
 | Commit running (D-state) | `/proc/<pid>/stat` + starttime correlation | procfs scan |
 | Defrag detection | `/proc/<pid>/cmdline` | procfs scan |
 | Bees stats | `/run/bees/<uuid>.status` | File read |
-| Orphan count | `btrfs subvolume list -d` | Command |
-| Subvolume list | `btrfs subvolume list -tupq` | Command |
-| Qgroup data | `btrfs qgroup show --raw` | Command |
-| Replace status | `btrfs replace status -1` | Command |
-| Balance status | `btrfs balance status` | Command |
-| Quota rescan | `btrfs quota rescan -s` | Command |
+| Orphan count | `BTRFS_IOC_TREE_SEARCH` (orphan items) | ioctl |
+| Subvolume list | `BTRFS_IOC_TREE_SEARCH` (root tree) | ioctl |
+| Qgroup data | `BTRFS_IOC_TREE_SEARCH` (quota tree) | ioctl |
+| Replace status | `BTRFS_IOC_DEV_REPLACE` | ioctl |
+| Balance status | `BTRFS_IOC_BALANCE_PROGRESS` | ioctl |
+| Quota rescan | `BTRFS_IOC_QUOTA_RESCAN_STATUS` | ioctl |
+| Device mapping | `BTRFS_IOC_DEV_INFO` + sysfs size matching | ioctl + sysfs |
 
 ## Caveats
 
 - **Snapshot detection** uses `parent_uuid` from btrfs metadata. A subvolume created via `btrfs subvolume snapshot` will be classified as a snapshot. If you restore a snapshot by renaming it to replace the original subvolume, it will still be detected as a snapshot (`parent_uuid` remains set). This only affects `COLLECT_SNAPSHOTS` / `COLLECT_SUBVOLUMES` filtering — the metrics themselves are always accurate.
-- **Simple quotas** (kernel 6.7+) may have delayed or frozen qgroup updates on older kernels (< 6.11). Kernel 6.17+ is recommended for reliable quota accounting.
-- **`btrfs_commit_running`** detects D-state on btrfs-transaction kernel threads. PID-to-filesystem mapping is done natively via `/proc` starttime correlation with dmesg mount timestamps. Accuracy depends on dmesg not being rotated since boot.
+- **`btrfs_commit_running`** detects D-state on btrfs-transaction kernel threads. PID-to-filesystem mapping is done natively via `/proc` starttime correlation with kernel log mount timestamps. Accuracy depends on kernel log not being rotated since boot.
 - **Root required** — the exporter must run as root to access btrfs ioctls, sysfs, and `/proc` data.
 
 ## License
