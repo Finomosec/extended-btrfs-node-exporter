@@ -724,34 +724,31 @@ func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS,
 	writeErrs := float64(status.WriteErrs)
 	readErrs := float64(status.ReadErrs)
 
-	// Find replace target + missing device via sysfs + device map
-	devMap := DevIDMap(fs.Mountpoint, fs.UUID)
-	targetDev := ""
-	missingDev := ""
+	// Resolve device names from sysfs devinfo
+	newDev := ""
+	oldDev := "MISSING"
 	devinfoBase := fmt.Sprintf("/sys/fs/btrfs/%s/devinfo", fs.UUID)
 	devinfos, _ := os.ReadDir(devinfoBase)
+	devMap := DevIDMap(fs.Mountpoint, fs.UUID)
 	for _, di := range devinfos {
-		rtData, err := os.ReadFile(filepath.Join(devinfoBase, di.Name(), "replace_target"))
-		if err != nil {
-			continue
-		}
+		rtData, _ := os.ReadFile(filepath.Join(devinfoBase, di.Name(), "replace_target"))
 		if strings.TrimSpace(string(rtData)) == "1" {
-			if name, ok := devMap[di.Name()]; ok {
-				targetDev = c.resolveDeviceName(name)
+			if name, ok := devMap[di.Name()]; ok && name != "missing" {
+				newDev = c.resolveDeviceName(name)
 			} else {
-				targetDev = "devid-" + di.Name()
+				newDev = "dev-" + di.Name()
 			}
 		}
 		missingData, _ := os.ReadFile(filepath.Join(devinfoBase, di.Name(), "missing"))
 		if strings.TrimSpace(string(missingData)) == "1" {
-			if name, ok := devMap[di.Name()]; ok {
-				missingDev = name
-			} else {
-				missingDev = "devid-" + di.Name()
-			}
+			oldDev = "dev-" + di.Name()
 		}
 	}
-	replaceLabels := append(labels, targetDev, missingDev)
+	if newDev == "" {
+		newDev = "unknown"
+	}
+
+	replaceLabels := append(labels, newDev, oldDev) // target_device, missing_devid
 	ch <- prometheus.MustNewConstMetric(c.replaceProgress, prometheus.GaugeValue, progress, replaceLabels...)
 	ch <- prometheus.MustNewConstMetric(c.replaceWriteErrs, prometheus.CounterValue, writeErrs, replaceLabels...)
 	ch <- prometheus.MustNewConstMetric(c.replaceReadErrs, prometheus.CounterValue, readErrs, replaceLabels...)
