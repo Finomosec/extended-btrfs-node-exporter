@@ -794,9 +794,10 @@ func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS,
 	writeErrs, _ := strconv.ParseFloat(m[2], 64)
 	readErrs, _ := strconv.ParseFloat(m[3], 64)
 
-	// Find replace target device via sysfs devinfo/*/replace_target
+	// Find replace target + missing device via sysfs + device map
+	devMap := devIDMap(fs.Mountpoint)
 	targetDev := ""
-	missingDevID := ""
+	missingDev := ""
 	devinfoBase := fmt.Sprintf("/sys/fs/btrfs/%s/devinfo", fs.UUID)
 	devinfos, _ := os.ReadDir(devinfoBase)
 	for _, di := range devinfos {
@@ -805,64 +806,47 @@ func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS,
 			continue
 		}
 		if strings.TrimSpace(string(rtData)) == "1" {
-			targetDev = devIDToName(fs.UUID, di.Name())
-			// The missing device is the one not in /sys/fs/btrfs/<uuid>/devices/
-			missingDevID = findMissingDevID(fs.UUID, devinfos)
+			if name, ok := devMap[di.Name()]; ok {
+				targetDev = c.resolveDeviceName(name)
+			} else {
+				targetDev = "devid-" + di.Name()
+			}
+		}
+		missingData, _ := os.ReadFile(filepath.Join(devinfoBase, di.Name(), "missing"))
+		if strings.TrimSpace(string(missingData)) == "1" {
+			if name, ok := devMap[di.Name()]; ok {
+				missingDev = name
+			} else {
+				missingDev = "devid-" + di.Name()
+			}
 		}
 	}
-
-	targetDev = c.resolveDeviceName(targetDev)
-	replaceLabels := append(labels, targetDev, missingDevID)
+	replaceLabels := append(labels, targetDev, missingDev)
 	ch <- prometheus.MustNewConstMetric(c.replaceProgress, prometheus.GaugeValue, progress, replaceLabels...)
 	ch <- prometheus.MustNewConstMetric(c.replaceWriteErrs, prometheus.CounterValue, writeErrs, replaceLabels...)
 	ch <- prometheus.MustNewConstMetric(c.replaceReadErrs, prometheus.CounterValue, readErrs, replaceLabels...)
 }
 
-// devIDToName maps a btrfs devid to a device name via sysfs
-func devIDToName(uuid, devid string) string {
-	devicesDir := fmt.Sprintf("/sys/fs/btrfs/%s/devices", uuid)
-	entries, err := os.ReadDir(devicesDir)
+// devIDMap builds a devid→device-name mapping via `btrfs device usage`
+func devIDMap(mountpoint string) map[string]string {
+	result := map[string]string{}
+	out, err := exec.Command("btrfs", "device", "usage", mountpoint).Output()
 	if err != nil {
-		return "devid-" + devid
+		return result
 	}
-	// Read the device's devid from sysfs to match
-	for _, e := range entries {
-		didPath := filepath.Join(devicesDir, e.Name(), "devid")
-		data, err := os.ReadFile(didPath)
-		if err != nil {
-			// Fallback: check via devinfo
-			continue
-		}
-		if strings.TrimSpace(string(data)) == devid {
-			return e.Name()
-		}
-	}
-	// devid 0 is the replace target — it maps to the device listed in devices/ that is not in devinfo with replace_target=0
-	return "devid-" + devid
-}
-
-// findMissingDevID finds the devid that is in devinfo but not in devices/ (the missing disk)
-func findMissingDevID(uuid string, devinfos []os.DirEntry) string {
-	devicesDir := fmt.Sprintf("/sys/fs/btrfs/%s/devices", uuid)
-	activeDevIDs := map[string]bool{}
-	entries, err := os.ReadDir(devicesDir)
-	if err != nil {
-		return "unknown"
-	}
-	for _, e := range entries {
-		didPath := filepath.Join(devicesDir, e.Name(), "devid")
-		data, _ := os.ReadFile(didPath)
-		activeDevIDs[strings.TrimSpace(string(data))] = true
-	}
-	for _, di := range devinfos {
-		if !activeDevIDs[di.Name()] {
-			rtData, _ := os.ReadFile(filepath.Join(fmt.Sprintf("/sys/fs/btrfs/%s/devinfo", uuid), di.Name(), "replace_target"))
-			if strings.TrimSpace(string(rtData)) != "1" {
-				return "devid-" + di.Name()
+	// Parse lines like: /dev/dm-8, ID: 0
+	re := regexp.MustCompile(`^(/dev/\S+|missing),\s+ID:\s+(\d+)`)
+	for _, line := range strings.Split(string(out), "\n") {
+		if m := re.FindStringSubmatch(strings.TrimSpace(line)); len(m) > 2 {
+			dev := m[1]
+			if dev == "missing" {
+				result[m[2]] = "missing"
+			} else {
+				result[m[2]] = filepath.Base(dev)
 			}
 		}
 	}
-	return "unknown"
+	return result
 }
 
 // collectBalance uses `btrfs balance status`
