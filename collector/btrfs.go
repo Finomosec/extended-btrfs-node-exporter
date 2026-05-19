@@ -475,12 +475,11 @@ func (c *BtrfsCollector) collectCommitStats(ch chan<- prometheus.Metric, fs btrf
 }
 
 // collectCommitRunning checks if btrfs-transaction thread is in D-state.
-// First tries /run/btrfs-thread-map (external script), then falls back to
-// native PID detection via /proc scanning.
+// Uses native /proc scanning to map transaction PIDs to filesystems.
 func (c *BtrfsCollector) collectCommitRunning(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
 	running := 0.0
 
-	pid := findTransactionPID(fs.UUID)
+	pid := c.findTransactionPID(fs.UUID)
 	if pid != "" {
 		statPath := fmt.Sprintf("/proc/%s/stat", pid)
 		stat, err := os.ReadFile(statPath)
@@ -494,29 +493,229 @@ func (c *BtrfsCollector) collectCommitRunning(ch chan<- prometheus.Metric, fs bt
 	ch <- prometheus.MustNewConstMetric(c.commitRunning, prometheus.GaugeValue, running, labels...)
 }
 
+// threadMap caches PID→UUID mapping, rebuilt when PIDs change
+var threadMap map[string]string // uuid → pid
+var threadMapPIDs string        // cached sorted PID list for staleness check
+
 // findTransactionPID finds the btrfs-transaction kernel thread PID for a given UUID.
-// Strategy: scan /proc for btrfs-transaction threads, then correlate via dmesg
-// "first mount" timestamps or the thread-map cache file.
-func findTransactionPID(uuid string) string {
-	// Try cached thread-map first
-	data, err := os.ReadFile("/run/btrfs-thread-map")
-	if err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) >= 3 && fields[0] == "transaction" && fields[2] == uuid {
-				// Verify PID still exists and is btrfs-transaction
-				comm, err := os.ReadFile(fmt.Sprintf("/proc/%s/comm", fields[1]))
-				if err == nil && strings.TrimSpace(string(comm)) == "btrfs-transaction" {
-					return fields[1]
+// Scans /proc for btrfs-transaction threads, reads their starttimes, correlates
+// with btrfs mount times from dmesg or mount order.
+func (c *BtrfsCollector) findTransactionPID(uuid string) string {
+	// Get current transaction PIDs
+	currentPIDs := findBtrfsTransactionPIDs()
+	pidsKey := strings.Join(currentPIDs, ",")
+
+	// Rebuild map if PIDs changed
+	if pidsKey != threadMapPIDs {
+		threadMap = buildThreadMap(currentPIDs)
+		threadMapPIDs = pidsKey
+	}
+
+	return threadMap[uuid]
+}
+
+// findBtrfsTransactionPIDs scans /proc for btrfs-transaction kernel threads
+func findBtrfsTransactionPIDs() []string {
+	var pids []string
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return pids
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		comm, err := os.ReadFile(filepath.Join("/proc", e.Name(), "comm"))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(comm)) == "btrfs-transaction" {
+			pids = append(pids, e.Name())
+		}
+	}
+	return pids
+}
+
+// pidStartTime reads the start time (in clock ticks) of a process from /proc/<pid>/stat
+func pidStartTime(pid string) float64 {
+	data, err := os.ReadFile(filepath.Join("/proc", pid, "stat"))
+	if err != nil {
+		return 0
+	}
+	// Field 22 (0-indexed: 21) is starttime, but we need to skip the comm field
+	// which can contain spaces/parens. Find closing paren first.
+	s := string(data)
+	idx := strings.LastIndex(s, ")")
+	if idx < 0 {
+		return 0
+	}
+	fields := strings.Fields(s[idx+2:]) // skip ") " then split
+	if len(fields) < 20 {
+		return 0
+	}
+	// starttime is field 20 after the closing paren (0-indexed)
+	ticks, _ := strconv.ParseFloat(fields[19], 64)
+	clkTck := float64(100) // sysconf(_SC_CLK_TCK), almost always 100 on Linux
+	return ticks / clkTck
+}
+
+// mountTimeFromDmesg extracts "first mount" timestamps from dmesg for each UUID
+func mountTimeFromDmesg() map[string]float64 {
+	result := map[string]float64{}
+	data, err := os.ReadFile("/dev/kmsg")
+	if err != nil {
+		// Fallback: try exec dmesg
+		out, err := exec.Command("dmesg").Output()
+		if err != nil {
+			return result
+		}
+		data = out
+	}
+
+	uuidRe := regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	tsRe := regexp.MustCompile(`^\[\s*([0-9.]+)\]`)
+
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.Contains(line, "first mount") {
+			continue
+		}
+		tsMatch := tsRe.FindStringSubmatch(line)
+		uuidMatch := uuidRe.FindString(line)
+		if len(tsMatch) > 1 && uuidMatch != "" {
+			ts, _ := strconv.ParseFloat(tsMatch[1], 64)
+			if _, exists := result[uuidMatch]; !exists {
+				result[uuidMatch] = ts
+			}
+		}
+	}
+	return result
+}
+
+// buildThreadMap correlates btrfs-transaction PIDs with filesystem UUIDs
+func buildThreadMap(pids []string) map[string]string {
+	result := map[string]string{} // uuid → pid
+
+	if len(pids) == 0 {
+		return result
+	}
+
+	// Collect all mounted btrfs UUIDs
+	filesystems := discoverFilesystems()
+	uuids := make([]string, 0, len(filesystems))
+	for _, fs := range filesystems {
+		uuids = append(uuids, fs.UUID)
+	}
+
+	// Easy case: same count, try correlating
+	if len(pids) == 1 && len(uuids) == 1 {
+		result[uuids[0]] = pids[0]
+		return result
+	}
+
+	// Strategy 1: dmesg timestamp correlation
+	mountTimes := mountTimeFromDmesg()
+	pidStarts := map[string]float64{}
+	for _, pid := range pids {
+		pidStarts[pid] = pidStartTime(pid)
+	}
+
+	mapped := map[string]bool{} // pid → mapped
+	for _, uuid := range uuids {
+		mt, ok := mountTimes[uuid]
+		if !ok {
+			continue
+		}
+		bestPID := ""
+		bestDiff := 999999.0
+		for _, pid := range pids {
+			if mapped[pid] {
+				continue
+			}
+			diff := pidStarts[pid] - mt
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff < bestDiff {
+				bestDiff = diff
+				bestPID = pid
+			}
+		}
+		if bestPID != "" && bestDiff < 5.0 { // within 5 seconds
+			result[uuid] = bestPID
+			mapped[bestPID] = true
+		}
+	}
+
+	// Strategy 2: root heuristic (oldest PID → root filesystem)
+	if len(result) < len(uuids) {
+		var rootUUID string
+		for _, fs := range filesystems {
+			if fs.Mountpoint == "/" {
+				rootUUID = fs.UUID
+				break
+			}
+		}
+		if rootUUID != "" && result[rootUUID] == "" {
+			oldestPID := ""
+			oldestStart := 999999999.0
+			for _, pid := range pids {
+				if mapped[pid] {
+					continue
 				}
+				if pidStarts[pid] < oldestStart {
+					oldestStart = pidStarts[pid]
+					oldestPID = pid
+				}
+			}
+			if oldestPID != "" {
+				result[rootUUID] = oldestPID
+				mapped[oldestPID] = true
 			}
 		}
 	}
 
-	// Fallback: scan /proc for btrfs-transaction threads and correlate
-	// via mount order (UUID → device → sysfs starttime correlation)
-	// For now, return empty — the external script handles this
-	return ""
+	// Strategy 3: single unmapped PID + single unmapped UUID
+	unmappedPIDs := []string{}
+	unmappedUUIDs := []string{}
+	for _, pid := range pids {
+		if !mapped[pid] {
+			unmappedPIDs = append(unmappedPIDs, pid)
+		}
+	}
+	for _, uuid := range uuids {
+		if result[uuid] == "" {
+			unmappedUUIDs = append(unmappedUUIDs, uuid)
+		}
+	}
+	if len(unmappedPIDs) == 1 && len(unmappedUUIDs) == 1 {
+		result[unmappedUUIDs[0]] = unmappedPIDs[0]
+		mapped[unmappedPIDs[0]] = true
+	}
+
+	// Strategy 4: mount-order correlation for remaining
+	if len(unmappedPIDs) > 1 && len(unmappedPIDs) == len(unmappedUUIDs) {
+		// Sort PIDs by starttime
+		sortedPIDs := make([]string, len(unmappedPIDs))
+		copy(sortedPIDs, unmappedPIDs)
+		for i := 0; i < len(sortedPIDs); i++ {
+			for j := i + 1; j < len(sortedPIDs); j++ {
+				if pidStarts[sortedPIDs[i]] > pidStarts[sortedPIDs[j]] {
+					sortedPIDs[i], sortedPIDs[j] = sortedPIDs[j], sortedPIDs[i]
+				}
+			}
+		}
+		// UUIDs are already in mount order from discoverFilesystems
+		for i, uuid := range unmappedUUIDs {
+			if i < len(sortedPIDs) {
+				result[uuid] = sortedPIDs[i]
+			}
+		}
+	}
+
+	return result
 }
 
 // collectExclusiveOp reads /sys/fs/btrfs/<uuid>/exclusive_operation (no subprocess)
