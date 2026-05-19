@@ -113,9 +113,9 @@ func New(cfg Config) *BtrfsCollector {
 		quotaRescanRunning: prometheus.NewDesc("btrfs_quota_rescan_running", "Whether quota rescan is running", labels, nil),
 		quotaRescanKey:     prometheus.NewDesc("btrfs_quota_rescan_current_key", "Quota rescan current key", labels, nil),
 
-		replaceProgress:  prometheus.NewDesc("btrfs_replace_progress_percent", "Device replace progress percent", append(labels, "target_device", "missing_devid"), nil),
-		replaceWriteErrs: prometheus.NewDesc("btrfs_replace_write_errors_total", "Device replace write errors", append(labels, "target_device", "missing_devid"), nil),
-		replaceReadErrs:  prometheus.NewDesc("btrfs_replace_read_errors_total", "Device replace uncorrectable read errors", append(labels, "target_device", "missing_devid"), nil),
+		replaceProgress:  prometheus.NewDesc("btrfs_replace_progress_percent", "Device replace progress percent", append(labels, "old_device", "new_device"), nil),
+		replaceWriteErrs: prometheus.NewDesc("btrfs_replace_write_errors_total", "Device replace write errors", append(labels, "old_device", "new_device"), nil),
+		replaceReadErrs:  prometheus.NewDesc("btrfs_replace_read_errors_total", "Device replace uncorrectable read errors", append(labels, "old_device", "new_device"), nil),
 
 		balanceChunksDone:       prometheus.NewDesc("btrfs_balance_chunks_done", "Balance chunks completed", labels, nil),
 		balanceChunksTotal:      prometheus.NewDesc("btrfs_balance_chunks_total", "Balance chunks total", labels, nil),
@@ -748,7 +748,7 @@ func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS,
 		newDev = "unknown"
 	}
 
-	replaceLabels := append(labels, newDev, oldDev) // target_device, missing_devid
+	replaceLabels := append(labels, oldDev, newDev) // old_device, new_device
 	ch <- prometheus.MustNewConstMetric(c.replaceProgress, prometheus.GaugeValue, progress, replaceLabels...)
 	ch <- prometheus.MustNewConstMetric(c.replaceWriteErrs, prometheus.CounterValue, writeErrs, replaceLabels...)
 	ch <- prometheus.MustNewConstMetric(c.replaceReadErrs, prometheus.CounterValue, readErrs, replaceLabels...)
