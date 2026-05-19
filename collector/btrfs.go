@@ -976,7 +976,7 @@ func (c *BtrfsCollector) resolveDeviceName(dmName string) string {
 			continue
 		}
 		if filepath.Base(link) == dmName || link == "/dev/"+dmName {
-			return "/dev/mapper/" + e.Name()
+			return e.Name()
 		}
 	}
 	return dmName
