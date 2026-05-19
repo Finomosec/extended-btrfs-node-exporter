@@ -165,7 +165,6 @@ func (c *BtrfsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.replaceReadErrs
 	ch <- c.cleanOrphansLeft
 	ch <- c.cleanOrphansMax
-	ch <- c.beesCounter
 	ch <- c.beesTasksProgress
 	ch <- c.beesTasksQueued
 	ch <- c.beesWorkers
@@ -922,7 +921,8 @@ func (c *BtrfsCollector) collectBees(ch chan<- prometheus.Metric, fs btrfsFS, la
 		if err != nil {
 			continue
 		}
-		ch <- prometheus.MustNewConstMetric(c.beesCounter, prometheus.CounterValue, val, append(labels, parts[0])...)
+		desc := prometheus.NewDesc("bees_"+parts[0], "Bees counter: "+parts[0], []string{"uuid", "mountpoint"}, nil)
+		ch <- prometheus.MustNewConstMetric(desc, prometheus.CounterValue, val, labels...)
 	}
 
 	// Parse THREADS line

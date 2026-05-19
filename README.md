@@ -121,7 +121,7 @@ curl http://localhost:9198/metrics | head -20
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `bees_counter` | counter | uuid, mountpoint, name | Bees dedup counters (dedup_bytes, block_bytes, etc.) |
+| `bees_<key>` | counter | uuid, mountpoint | Bees dedup counters — one metric per key (e.g. `bees_dedup_bytes`, `bees_block_bytes`) |
 | `bees_tasks_in_progress` | gauge | uuid, mountpoint | Bees tasks in progress |
 | `bees_tasks_queued` | gauge | uuid, mountpoint | Bees tasks queued |
 | `bees_thread_workers` | gauge | uuid, mountpoint | Bees worker threads |
