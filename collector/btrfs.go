@@ -334,14 +334,15 @@ func (c *BtrfsCollector) collectSubvolumes(ch chan<- prometheus.Metric, fs btrfs
 		if strings.HasPrefix(line, "ID") || strings.HasPrefix(line, "--") || strings.TrimSpace(line) == "" {
 			continue
 		}
-		// Tab-separated: ID gen parent top_level parent_uuid uuid path
+		// Tab-separated: ID gen parent top_level (empty) parent_uuid uuid path
+		// Note: field[4] is always empty (double-tab), parent_uuid is field[5]
 		fields := strings.Split(line, "\t")
-		if len(fields) < 7 {
+		if len(fields) < 8 {
 			continue
 		}
 		subvolID := strings.TrimSpace(fields[0])
 		gen := strings.TrimSpace(fields[1])
-		parentUUID := strings.TrimSpace(fields[4])
+		parentUUID := strings.TrimSpace(fields[5])
 		path := strings.TrimSpace(fields[len(fields)-1])
 
 		isSnapshot := parentUUID != "" && parentUUID != "-" && !strings.HasPrefix(parentUUID, "-")
@@ -383,11 +384,11 @@ func snapshotIDs(mountpoint string) map[string]bool {
 	}
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Split(line, "\t")
-		if len(fields) < 7 {
+		if len(fields) < 8 {
 			continue
 		}
 		subvolID := strings.TrimSpace(fields[0])
-		parentUUID := strings.TrimSpace(fields[4])
+		parentUUID := strings.TrimSpace(fields[5])
 		if parentUUID != "" && parentUUID != "-" && !strings.HasPrefix(parentUUID, "-") {
 			result[subvolID] = true
 		}
