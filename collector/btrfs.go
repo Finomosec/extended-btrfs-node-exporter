@@ -737,7 +737,7 @@ func (c *BtrfsCollector) collectBees(ch chan<- prometheus.Metric, fs btrfsFS, la
 
 // resolveDeviceName resolves dm-X to /dev/mapper/luks-* if UseLuksDeviceNames is enabled
 func (c *BtrfsCollector) resolveDeviceName(dmName string) string {
-	if !c.cfg.UseLuksDeviceNames {
+	if !c.cfg.ResolveDeviceMapper {
 		return dmName
 	}
 	// Check /dev/mapper/ for symlinks pointing to this dm device
