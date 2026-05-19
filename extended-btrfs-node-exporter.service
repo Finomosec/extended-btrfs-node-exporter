@@ -1,0 +1,24 @@
+[Unit]
+Description=Extended BTRFS Node Exporter
+After=network.target local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/extended-btrfs-node-exporter
+EnvironmentFile=-/etc/default/extended-btrfs-node-exporter
+Restart=on-failure
+RestartSec=5
+
+# Run as root (required for btrfs ioctls and sysfs access)
+User=root
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp /run
+PrivateTmp=no
+
+[Install]
+WantedBy=multi-user.target
