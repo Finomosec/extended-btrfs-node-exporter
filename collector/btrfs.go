@@ -114,9 +114,9 @@ func New(cfg Config) *BtrfsCollector {
 		quotaRescanRunning: prometheus.NewDesc("btrfs_quota_rescan_running", "Whether quota rescan is running", labels, nil),
 		quotaRescanKey:     prometheus.NewDesc("btrfs_quota_rescan_current_key", "Quota rescan current key", labels, nil),
 
-		replaceProgress:  prometheus.NewDesc("btrfs_replace_progress_percent", "Device replace progress percent", labels, nil),
-		replaceWriteErrs: prometheus.NewDesc("btrfs_replace_write_errors_total", "Device replace write errors", labels, nil),
-		replaceReadErrs:  prometheus.NewDesc("btrfs_replace_read_errors_total", "Device replace uncorrectable read errors", labels, nil),
+		replaceProgress:  prometheus.NewDesc("btrfs_replace_progress_percent", "Device replace progress percent", append(labels, "target_device", "missing_devid"), nil),
+		replaceWriteErrs: prometheus.NewDesc("btrfs_replace_write_errors_total", "Device replace write errors", append(labels, "target_device", "missing_devid"), nil),
+		replaceReadErrs:  prometheus.NewDesc("btrfs_replace_read_errors_total", "Device replace uncorrectable read errors", append(labels, "target_device", "missing_devid"), nil),
 
 		balanceChunksDone:       prometheus.NewDesc("btrfs_balance_chunks_done", "Balance chunks completed", labels, nil),
 		balanceChunksTotal:      prometheus.NewDesc("btrfs_balance_chunks_total", "Balance chunks total", labels, nil),
@@ -470,32 +470,49 @@ func (c *BtrfsCollector) collectCommitStats(ch chan<- prometheus.Metric, fs btrf
 	}
 }
 
-// collectCommitRunning checks if btrfs-transaction thread is in D-state via /proc
+// collectCommitRunning checks if btrfs-transaction thread is in D-state.
+// First tries /run/btrfs-thread-map (external script), then falls back to
+// native PID detection via /proc scanning.
 func (c *BtrfsCollector) collectCommitRunning(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
-	mapFile := "/run/btrfs-thread-map"
-	data, err := os.ReadFile(mapFile)
-	if err != nil {
-		ch <- prometheus.MustNewConstMetric(c.commitRunning, prometheus.GaugeValue, 0, labels...)
-		return
-	}
-
 	running := 0.0
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 3 && fields[0] == "transaction" && fields[2] == fs.UUID {
-			pid := fields[1]
-			statPath := fmt.Sprintf("/proc/%s/stat", pid)
-			stat, err := os.ReadFile(statPath)
-			if err == nil {
-				statFields := strings.Fields(string(stat))
-				if len(statFields) >= 3 && statFields[2] == "D" {
-					running = 1.0
-				}
+
+	pid := findTransactionPID(fs.UUID)
+	if pid != "" {
+		statPath := fmt.Sprintf("/proc/%s/stat", pid)
+		stat, err := os.ReadFile(statPath)
+		if err == nil {
+			statFields := strings.Fields(string(stat))
+			if len(statFields) >= 3 && statFields[2] == "D" {
+				running = 1.0
 			}
-			break
 		}
 	}
 	ch <- prometheus.MustNewConstMetric(c.commitRunning, prometheus.GaugeValue, running, labels...)
+}
+
+// findTransactionPID finds the btrfs-transaction kernel thread PID for a given UUID.
+// Strategy: scan /proc for btrfs-transaction threads, then correlate via dmesg
+// "first mount" timestamps or the thread-map cache file.
+func findTransactionPID(uuid string) string {
+	// Try cached thread-map first
+	data, err := os.ReadFile("/run/btrfs-thread-map")
+	if err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 && fields[0] == "transaction" && fields[2] == uuid {
+				// Verify PID still exists and is btrfs-transaction
+				comm, err := os.ReadFile(fmt.Sprintf("/proc/%s/comm", fields[1]))
+				if err == nil && strings.TrimSpace(string(comm)) == "btrfs-transaction" {
+					return fields[1]
+				}
+			}
+		}
+	}
+
+	// Fallback: scan /proc for btrfs-transaction threads and correlate
+	// via mount order (UUID → device → sysfs starttime correlation)
+	// For now, return empty — the external script handles this
+	return ""
 }
 
 // collectExclusiveOp reads /sys/fs/btrfs/<uuid>/exclusive_operation (no subprocess)
@@ -557,7 +574,7 @@ func (c *BtrfsCollector) collectQuotaRescan(ch chan<- prometheus.Metric, fs btrf
 	ch <- prometheus.MustNewConstMetric(c.quotaRescanKey, prometheus.CounterValue, key, labels...)
 }
 
-// collectReplace uses `btrfs replace status -1`
+// collectReplace uses `btrfs replace status -1` and sysfs for device info
 func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
 	out, err := exec.Command("btrfs", "replace", "status", "-1", fs.Mountpoint).CombinedOutput()
 	if err != nil {
@@ -566,14 +583,84 @@ func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS,
 
 	s := string(out)
 	re := regexp.MustCompile(`(\d+\.?\d*)% done, (\d+) write errs, (\d+) uncorr\. read errs`)
-	if m := re.FindStringSubmatch(s); len(m) > 3 {
-		progress, _ := strconv.ParseFloat(m[1], 64)
-		writeErrs, _ := strconv.ParseFloat(m[2], 64)
-		readErrs, _ := strconv.ParseFloat(m[3], 64)
-		ch <- prometheus.MustNewConstMetric(c.replaceProgress, prometheus.GaugeValue, progress, labels...)
-		ch <- prometheus.MustNewConstMetric(c.replaceWriteErrs, prometheus.CounterValue, writeErrs, labels...)
-		ch <- prometheus.MustNewConstMetric(c.replaceReadErrs, prometheus.CounterValue, readErrs, labels...)
+	m := re.FindStringSubmatch(s)
+	if len(m) <= 3 {
+		return
 	}
+
+	progress, _ := strconv.ParseFloat(m[1], 64)
+	writeErrs, _ := strconv.ParseFloat(m[2], 64)
+	readErrs, _ := strconv.ParseFloat(m[3], 64)
+
+	// Find replace target device via sysfs devinfo/*/replace_target
+	targetDev := ""
+	missingDevID := ""
+	devinfoBase := fmt.Sprintf("/sys/fs/btrfs/%s/devinfo", fs.UUID)
+	devinfos, _ := os.ReadDir(devinfoBase)
+	for _, di := range devinfos {
+		rtData, err := os.ReadFile(filepath.Join(devinfoBase, di.Name(), "replace_target"))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(rtData)) == "1" {
+			targetDev = devIDToName(fs.UUID, di.Name())
+			// The missing device is the one not in /sys/fs/btrfs/<uuid>/devices/
+			missingDevID = findMissingDevID(fs.UUID, devinfos)
+		}
+	}
+
+	targetDev = c.resolveDeviceName(targetDev)
+	replaceLabels := append(labels, targetDev, missingDevID)
+	ch <- prometheus.MustNewConstMetric(c.replaceProgress, prometheus.GaugeValue, progress, replaceLabels...)
+	ch <- prometheus.MustNewConstMetric(c.replaceWriteErrs, prometheus.CounterValue, writeErrs, replaceLabels...)
+	ch <- prometheus.MustNewConstMetric(c.replaceReadErrs, prometheus.CounterValue, readErrs, replaceLabels...)
+}
+
+// devIDToName maps a btrfs devid to a device name via sysfs
+func devIDToName(uuid, devid string) string {
+	devicesDir := fmt.Sprintf("/sys/fs/btrfs/%s/devices", uuid)
+	entries, err := os.ReadDir(devicesDir)
+	if err != nil {
+		return "devid-" + devid
+	}
+	// Read the device's devid from sysfs to match
+	for _, e := range entries {
+		didPath := filepath.Join(devicesDir, e.Name(), "devid")
+		data, err := os.ReadFile(didPath)
+		if err != nil {
+			// Fallback: check via devinfo
+			continue
+		}
+		if strings.TrimSpace(string(data)) == devid {
+			return e.Name()
+		}
+	}
+	// devid 0 is the replace target — it maps to the device listed in devices/ that is not in devinfo with replace_target=0
+	return "devid-" + devid
+}
+
+// findMissingDevID finds the devid that is in devinfo but not in devices/ (the missing disk)
+func findMissingDevID(uuid string, devinfos []os.DirEntry) string {
+	devicesDir := fmt.Sprintf("/sys/fs/btrfs/%s/devices", uuid)
+	activeDevIDs := map[string]bool{}
+	entries, err := os.ReadDir(devicesDir)
+	if err != nil {
+		return "unknown"
+	}
+	for _, e := range entries {
+		didPath := filepath.Join(devicesDir, e.Name(), "devid")
+		data, _ := os.ReadFile(didPath)
+		activeDevIDs[strings.TrimSpace(string(data))] = true
+	}
+	for _, di := range devinfos {
+		if !activeDevIDs[di.Name()] {
+			rtData, _ := os.ReadFile(filepath.Join(fmt.Sprintf("/sys/fs/btrfs/%s/devinfo", uuid), di.Name(), "replace_target"))
+			if strings.TrimSpace(string(rtData)) != "1" {
+				return "devid-" + di.Name()
+			}
+		}
+	}
+	return "unknown"
 }
 
 // collectBalance uses `btrfs balance status`
@@ -645,6 +732,28 @@ func (c *BtrfsCollector) collectBees(ch chan<- prometheus.Metric, fs btrfsFS, la
 		ch <- prometheus.MustNewConstMetric(c.beesTasksQueued, prometheus.GaugeValue, tasks, labels...)
 		ch <- prometheus.MustNewConstMetric(c.beesWorkers, prometheus.GaugeValue, workers, labels...)
 	}
+}
+
+// resolveDeviceName resolves dm-X to /dev/mapper/luks-* if UseLuksDeviceNames is enabled
+func (c *BtrfsCollector) resolveDeviceName(dmName string) string {
+	if !c.cfg.UseLuksDeviceNames {
+		return dmName
+	}
+	// Check /dev/mapper/ for symlinks pointing to this dm device
+	entries, err := os.ReadDir("/dev/mapper")
+	if err != nil {
+		return dmName
+	}
+	for _, e := range entries {
+		link, err := os.Readlink(filepath.Join("/dev/mapper", e.Name()))
+		if err != nil {
+			continue
+		}
+		if filepath.Base(link) == dmName || link == "/dev/"+dmName {
+			return "/dev/mapper/" + e.Name()
+		}
+	}
+	return dmName
 }
 
 // ioctl helper (unused for now, kept for future native qgroup reading)

@@ -14,6 +14,9 @@ type Config struct {
 	IncludeSubvolumes []string // empty = all
 	ExcludeSubvolumes []string
 
+	// Device name display: false = dm-X (raw), true = /dev/mapper/luks-sdX (resolved)
+	UseLuksDeviceNames bool
+
 	// Collector modules (all true by default)
 	CollectSubvolumes bool // non-snapshot subvolumes
 	CollectSnapshots  bool // snapshot subvolumes
@@ -30,7 +33,8 @@ type Config struct {
 func LoadConfig() Config {
 	cfg := Config{
 		BeesStatusDir:     "/run/bees",
-		CollectSubvolumes: envBool("COLLECT_SUBVOLUMES", true),
+		UseLuksDeviceNames: envBool("USE_LUKS_DEVICE_NAMES", false),
+		CollectSubvolumes:  envBool("COLLECT_SUBVOLUMES", true),
 		CollectSnapshots:  envBool("COLLECT_SNAPSHOTS", true),
 		CollectQgroups:    envBool("COLLECT_QGROUPS", true),
 		CollectCommit:     envBool("COLLECT_COMMIT", true),
