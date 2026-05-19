@@ -4,8 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"log"
-	
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -242,7 +241,6 @@ func listSubvolumesImpl(fd int, mountpoint string) ([]SubvolInfo, error) {
 		}
 	}
 
-	log.Printf("  listSubvols done: %d subvols, %d backrefs", len(result), len(backrefs))
 
 	// Build paths from backrefs
 	for i := range result {
@@ -615,10 +613,22 @@ var devIDMapCacheMu sync.Mutex
 
 // DevIDMap builds devid→device-name mapping via BTRFS_IOC_DEV_INFO (path at offset 3072)
 func DevIDMap(fd int, mountpoint string, uuid string) map[string]string {
+	// Check cache — invalidate if device count changed
+	devicesDir := fmt.Sprintf("/sys/fs/btrfs/%s/devices", uuid)
+	entries, _ := os.ReadDir(devicesDir)
 	devIDMapCacheMu.Lock()
 	if cached, ok := devIDMapCache[uuid]; ok {
-		devIDMapCacheMu.Unlock()
-		return cached
+		// Invalidate if number of active devices changed
+		activeCount := 0
+		for _, v := range cached {
+			if v != "missing" {
+				activeCount++
+			}
+		}
+		if activeCount == len(entries) {
+			devIDMapCacheMu.Unlock()
+			return cached
+		}
 	}
 	devIDMapCacheMu.Unlock()
 

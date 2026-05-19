@@ -141,6 +141,12 @@ func New(cfg Config) *BtrfsCollector {
 	}
 }
 
+func (c *BtrfsCollector) debugf(format string, args ...interface{}) {
+	if c.cfg.Debug {
+		log.Printf(format, args...)
+	}
+}
+
 func (c *BtrfsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.totalBytes
 	ch <- c.usedBytes
@@ -314,6 +320,84 @@ func (c *BtrfsCollector) collectFS(ch chan<- prometheus.Metric, fs btrfsFS) {
 	if c.cfg.CollectOrphans {
 		c.collectOrphans(ch, fs, labels)
 	}
+	if c.cfg.CollectScrub {
+		c.collectScrub(ch, fs, labels)
+	}
+}
+
+// collectScrub reads scrub status from /var/lib/btrfs/scrub.status.<uuid> (no subprocess)
+func (c *BtrfsCollector) collectScrub(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
+	statusFile := fmt.Sprintf("/var/lib/btrfs/scrub.status.%s", fs.UUID)
+	data, err := os.ReadFile(statusFile)
+	if err != nil {
+		return // no scrub status
+	}
+
+	// Parse pipe-separated records: uuid:diskid|key:val|key:val|...
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "scrub") {
+			continue
+		}
+
+		fields := strings.Split(line, "|")
+		if len(fields) < 2 {
+			continue
+		}
+
+		// First field: uuid:diskid
+		idParts := strings.SplitN(fields[0], ":", 2)
+		if len(idParts) < 2 {
+			continue
+		}
+		diskID := idParts[1]
+		if diskID == "" {
+			continue
+		}
+
+		// Parse key:value pairs
+		vals := map[string]string{}
+		for _, f := range fields[1:] {
+			kv := strings.SplitN(f, ":", 2)
+			if len(kv) == 2 {
+				vals[kv[0]] = kv[1]
+			}
+		}
+
+		// Determine status
+		status := "idle"
+		if vals["finished"] == "1" {
+			status = "finished"
+		} else if vals["canceled"] == "1" {
+			status = "canceled"
+		} else if vals["t_start"] != "" && vals["t_start"] != "0" && vals["finished"] != "1" && vals["canceled"] != "1" {
+			status = "running"
+		}
+
+		deviceLabels := []string{fs.UUID, fs.Mountpoint, diskID}
+
+		// Status per device
+		for _, st := range []string{"running", "finished", "canceled", "idle"} {
+			val := 0.0
+			if st == status {
+				val = 1.0
+			}
+			ch <- prometheus.MustNewConstMetric(c.scrubStatus, prometheus.GaugeValue, val,
+				append(deviceLabels, st)...)
+		}
+
+		// Error counters per device
+		errorTypes := []string{"read_errors", "csum_errors", "verify_errors", "super_errors",
+			"uncorrectable_errors", "corrected_errors", "last_physical"}
+		for _, et := range errorTypes {
+			if v, ok := vals[et]; ok {
+				val, _ := strconv.ParseFloat(v, 64)
+				ch <- prometheus.MustNewConstMetric(c.scrubErrors, prometheus.CounterValue, val,
+					append(deviceLabels, et)...)
+			}
+		}
+	}
 }
 
 // readExclusiveOp reads the current exclusive operation from sysfs (never blocks)
@@ -392,7 +476,7 @@ func (c *BtrfsCollector) collectQgroups(ch chan<- prometheus.Metric, fs btrfsFS,
 		ch <- prometheus.MustNewConstMetric(c.subvolDiskUsage, prometheus.GaugeValue, float64(qg.Exclusive), subvolLabels...)
 		emitted++
 	}
-	log.Printf("[%s] collectQgroups: %d qgroups read, %d emitted", fs.Mountpoint, len(qgroups), emitted)
+	c.debugf("[%s] collectQgroups: %d qgroups read, %d emitted", fs.Mountpoint, len(qgroups), emitted)
 }
 
 // collectCommitStats reads /sys/fs/btrfs/<uuid>/commit_stats (no subprocess)
@@ -740,7 +824,7 @@ func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS,
 	devinfoBase := fmt.Sprintf("/sys/fs/btrfs/%s/devinfo", fs.UUID)
 	devinfos, _ := os.ReadDir(devinfoBase)
 	devMap := DevIDMap(fs.fd, fs.Mountpoint, fs.UUID)
-	log.Printf("[%s] DevIDMap: %v", fs.Mountpoint, devMap)
+	c.debugf("[%s] DevIDMap: %v", fs.Mountpoint, devMap)
 	for _, di := range devinfos {
 		rtData, _ := os.ReadFile(filepath.Join(devinfoBase, di.Name(), "replace_target"))
 		if strings.TrimSpace(string(rtData)) == "1" {

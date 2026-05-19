@@ -22,6 +22,9 @@ type Config struct {
 	// Timeout for ioctl calls (protects against kernel lock contention)
 	IoctlTimeout time.Duration
 
+	// Log level: "info" (default) or "debug"
+	Debug bool
+
 	// Collector modules (all true by default)
 	CollectSubvolumes bool // non-snapshot subvolumes
 	CollectSnapshots  bool // snapshot subvolumes
@@ -40,6 +43,7 @@ func LoadConfig() Config {
 		BeesStatusDir:     "/run/bees",
 		ResolveDeviceMapper: envBool("RESOLVE_DEVICE_MAPPER", false),
 		IoctlTimeout:       envDuration("IOCTL_TIMEOUT_SECS", 30),
+		Debug:              envBool("DEBUG", false),
 		CollectSubvolumes:  envBool("COLLECT_SUBVOLUMES", true),
 		CollectSnapshots:  envBool("COLLECT_SNAPSHOTS", true),
 		CollectQgroups:    envBool("COLLECT_QGROUPS", true),
