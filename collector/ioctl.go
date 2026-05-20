@@ -493,17 +493,19 @@ type balanceProgress struct {
 }
 
 type balanceFilterArgs struct {
-	Profiles uint64
-	Usage    uint64
-	Devid    uint64
-	Pstart   uint64
-	Pend     uint64
-	Vstart   uint64
-	Vend     uint64
-	Target   uint64
-	Flags    uint64
-	Limit    uint64
-	Stripes  [6]uint64
+	Profiles   uint64
+	Usage      uint64
+	Devid      uint64
+	Pstart     uint64
+	Pend       uint64
+	Vstart     uint64
+	Vend       uint64
+	Target     uint64
+	Flags      uint64
+	Limit      uint64
+	StripesMin uint32
+	StripesMax uint32
+	Unused     [6]uint64
 }
 
 type balanceArgs struct {
@@ -542,6 +544,8 @@ func getBalanceStatusImpl(fd int, mountpoint string) (*BalanceStatus, error) {
 	var args balanceArgs
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), iocBalanceProgress, uintptr(unsafe.Pointer(&args)))
 	if errno != 0 {
+		// ENOTCONN = no balance running (normal case)
+		return &BalanceStatus{Running: false}, nil
 	}
 
 	state := "running"
