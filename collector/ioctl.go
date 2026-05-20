@@ -433,12 +433,10 @@ type devReplaceArgs struct {
 const devReplaceCmdStatus = 1
 
 type ReplaceStatus struct {
-	Running    bool
-	Progress   float64
-	WriteErrs  uint64
-	ReadErrs   uint64
-	SrcDevID   uint64
-	TgtDevName string
+	Running   bool
+	Progress  float64
+	WriteErrs uint64
+	ReadErrs  uint64
 }
 
 // GetReplaceStatus queries device replace status via ioctl
@@ -455,6 +453,7 @@ func getReplaceStatusImpl(fd int, mountpoint string) (*ReplaceStatus, error) {
 
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), iocDevReplace, uintptr(unsafe.Pointer(&args)))
 	if errno != 0 {
+		return nil, nil
 	}
 
 	if args.Result != 0 { // BTRFS_IOCTL_DEV_REPLACE_RESULT_NO_ERROR = 0
@@ -462,25 +461,18 @@ func getReplaceStatusImpl(fd int, mountpoint string) (*ReplaceStatus, error) {
 	}
 
 	// Status params start at offset 16 (after cmd + result)
-	statusPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&args)) + 16)
-	status := (*devReplaceStatusParams)(statusPtr)
+	status := (*devReplaceStatusParams)(unsafe.Pointer(uintptr(unsafe.Pointer(&args)) + 16))
 	if status.ReplaceState == 0 { // NEVER_STARTED
 		return nil, nil
 	}
 
-	// Try to read source devid from the union (start_params overlay)
-	srcDevID := *(*uint64)(statusPtr) // same offset as replace_state, but on start cmd it holds srcdevid
-	// srcdev_name at offset 16, tgtdev_name at offset 16+1025
-	tgtNameBytes := (*[1025]byte)(unsafe.Pointer(uintptr(statusPtr) + 16 + 1025))
-	tgtName := strings.TrimRight(string(tgtNameBytes[:]), "\x00")
-
+	// Note: srcdevid and tgtdev_name are only in start_params (different union member),
+	// not populated by STATUS cmd. Device names are resolved via sysfs in collectReplace.
 	return &ReplaceStatus{
 		Running:   status.ReplaceState == 1,
 		Progress:  float64(status.Progress1000) / 10.0,
 		WriteErrs: status.NumWriteErrs,
 		ReadErrs:  status.NumReadErrs,
-		SrcDevID:  srcDevID,
-		TgtDevName: tgtName,
 	}, nil
 }
 
