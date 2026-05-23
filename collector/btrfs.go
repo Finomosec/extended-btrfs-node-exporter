@@ -79,7 +79,8 @@ type BtrfsCollector struct {
 	cleanOrphansMax  *prometheus.Desc
 
 	// Device
-	deviceSizeBytes  *prometheus.Desc
+	deviceSizeBytes   *prometheus.Desc
+	deviceUnusedBytes *prometheus.Desc
 	deviceErrorsTotal *prometheus.Desc
 
 	// Bees
@@ -155,6 +156,7 @@ func New(cfg Config) *BtrfsCollector {
 		beesWorkers:       prometheus.NewDesc("bees_thread_workers", "Bees worker threads", labels, nil),
 
 		deviceSizeBytes:   prometheus.NewDesc("btrfs_device_size_bytes", "Size of a device in the filesystem", append(deviceLabels, "btrfs_dev_uuid"), nil),
+		deviceUnusedBytes: prometheus.NewDesc("btrfs_device_unused_bytes", "Unused bytes on a device in the filesystem", append(deviceLabels, "btrfs_dev_uuid"), nil),
 		deviceErrorsTotal: prometheus.NewDesc("btrfs_device_errors_total", "Device errors by type", append(deviceLabels, "btrfs_dev_uuid", "type"), nil),
 
 		commitTracker: map[string]*commitState{},
@@ -194,6 +196,7 @@ func (c *BtrfsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.beesTasksQueued
 	ch <- c.beesWorkers
 	ch <- c.deviceSizeBytes
+	ch <- c.deviceUnusedBytes
 	ch <- c.deviceErrorsTotal
 }
 
@@ -387,6 +390,8 @@ func (c *BtrfsCollector) collectDevices(ch chan<- prometheus.Metric, fs btrfsFS,
 
 		if args.TotalBytes > 0 {
 			ch <- prometheus.MustNewConstMetric(c.deviceSizeBytes, prometheus.GaugeValue, float64(args.TotalBytes), devLabels...)
+			unused := args.TotalBytes - args.BytesUsed
+			ch <- prometheus.MustNewConstMetric(c.deviceUnusedBytes, prometheus.GaugeValue, float64(unused), devLabels...)
 		}
 
 		// Error stats from sysfs
