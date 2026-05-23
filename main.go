@@ -24,7 +24,10 @@ func main() {
 	c := collector.New(cfg)
 	prometheus.MustRegister(c)
 
-	http.Handle("/metrics", promhttp.Handler())
+	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		c.SetCurrentScraper(r.RemoteAddr)
+		promhttp.Handler().ServeHTTP(w, r)
+	})
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html><head><title>Extended BTRFS Exporter</title></head>
 		<body><h1>Extended BTRFS Exporter</h1>

@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -77,17 +78,31 @@ type BtrfsCollector struct {
 	cleanOrphansLeft *prometheus.Desc
 	cleanOrphansMax  *prometheus.Desc
 
+	// Device
+	deviceSizeBytes  *prometheus.Desc
+	deviceErrorsTotal *prometheus.Desc
+
 	// Bees
 	beesCounter       *prometheus.Desc
 	beesTasksProgress *prometheus.Desc
 	beesTasksQueued   *prometheus.Desc
 	beesWorkers       *prometheus.Desc
+
+	// Once-per-scraper tracking for last_commit_ms
+	commitMu       sync.Mutex
+	commitTracker  map[string]*commitState // UUID → state
+	currentScraper string
+}
+
+type commitState struct {
+	lastSeenCommits float64
+	reportedTo      map[string]bool
 }
 
 func New(cfg Config) *BtrfsCollector {
 	labels := []string{"uuid", "mountpoint"}
 	subvolLabels := []string{"uuid", "mountpoint", "subvolume", "subvolume_id"}
-	deviceLabels := []string{"uuid", "mountpoint", "disk_id"}
+	deviceLabels := []string{"uuid", "mountpoint", "device"}
 
 	return &BtrfsCollector{
 		cfg: cfg,
@@ -138,6 +153,11 @@ func New(cfg Config) *BtrfsCollector {
 		beesTasksProgress: prometheus.NewDesc("bees_tasks_in_progress", "Bees tasks in progress", labels, nil),
 		beesTasksQueued:   prometheus.NewDesc("bees_tasks_queued", "Bees tasks queued", labels, nil),
 		beesWorkers:       prometheus.NewDesc("bees_thread_workers", "Bees worker threads", labels, nil),
+
+		deviceSizeBytes:   prometheus.NewDesc("btrfs_device_size_bytes", "Size of a device in the filesystem", append(deviceLabels, "btrfs_dev_uuid"), nil),
+		deviceErrorsTotal: prometheus.NewDesc("btrfs_device_errors_total", "Device errors by type", append(deviceLabels, "btrfs_dev_uuid", "type"), nil),
+
+		commitTracker: map[string]*commitState{},
 	}
 }
 
@@ -173,6 +193,8 @@ func (c *BtrfsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.beesTasksProgress
 	ch <- c.beesTasksQueued
 	ch <- c.beesWorkers
+	ch <- c.deviceSizeBytes
+	ch <- c.deviceErrorsTotal
 }
 
 func (c *BtrfsCollector) Collect(ch chan<- prometheus.Metric) {
@@ -322,6 +344,65 @@ func (c *BtrfsCollector) collectFS(ch chan<- prometheus.Metric, fs btrfsFS) {
 	}
 	if c.cfg.CollectScrub {
 		c.collectScrub(ch, fs, labels)
+	}
+	// Device metrics are always collected (like filesystem-level metrics)
+	c.collectDevices(ch, fs, labels)
+}
+
+// collectDevices reads per-device size (from ioctl) and error stats (from sysfs)
+func (c *BtrfsCollector) collectDevices(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
+	devMap := DevIDMap(fs.fd, fs.Mountpoint, fs.UUID)
+	devinfoBase := fmt.Sprintf("/sys/fs/btrfs/%s/devinfo", fs.UUID)
+	devinfos, err := os.ReadDir(devinfoBase)
+	if err != nil {
+		return
+	}
+
+	for _, di := range devinfos {
+		devID := di.Name()
+		deviceName := devMap[devID]
+		if deviceName == "" {
+			deviceName = "dev-" + devID
+		}
+		if c.cfg.ResolveDeviceMapper && deviceName != "missing" {
+			deviceName = c.resolveDeviceName(deviceName)
+		}
+
+		// Device info from ioctl (size + UUID)
+		var args devInfoArgs
+		did, _ := strconv.ParseUint(devID, 10, 64)
+		args.DevID = did
+		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fs.fd), iocDevInfo, uintptr(unsafe.Pointer(&args)))
+		if errno != 0 {
+			continue
+		}
+
+		// Format btrfs_dev_uuid from ioctl response (no byte-swapping, matches node_exporter)
+		u := args.UUID
+		devUUID := fmt.Sprintf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+			u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+			u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15])
+
+		devLabels := append(labels, deviceName, devUUID)
+
+		if args.TotalBytes > 0 {
+			ch <- prometheus.MustNewConstMetric(c.deviceSizeBytes, prometheus.GaugeValue, float64(args.TotalBytes), devLabels...)
+		}
+
+		// Error stats from sysfs
+		errData, err := os.ReadFile(filepath.Join(devinfoBase, devID, "error_stats"))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(errData), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) != 2 {
+				continue
+			}
+			val, _ := strconv.ParseFloat(fields[1], 64)
+			errType := strings.TrimSuffix(fields[0], "_errs")
+			ch <- prometheus.MustNewConstMetric(c.deviceErrorsTotal, prometheus.CounterValue, val, append(devLabels, errType)...)
+		}
 	}
 }
 
@@ -479,7 +560,22 @@ func (c *BtrfsCollector) collectQgroups(ch chan<- prometheus.Metric, fs btrfsFS,
 	c.debugf("[%s] collectQgroups: %d qgroups read, %d emitted", fs.Mountpoint, len(qgroups), emitted)
 }
 
-// collectCommitStats reads /sys/fs/btrfs/<uuid>/commit_stats (no subprocess)
+// SetCurrentScraper records the scraper IP for once-per-scraper tracking.
+// Called from the HTTP handler before promhttp serves the request.
+func (c *BtrfsCollector) SetCurrentScraper(remoteAddr string) {
+	// Strip port — same Prometheus instance may connect from different source ports
+	host := remoteAddr
+	if idx := strings.LastIndex(remoteAddr, ":"); idx >= 0 {
+		host = remoteAddr[:idx]
+	}
+	c.commitMu.Lock()
+	c.currentScraper = host
+	c.commitMu.Unlock()
+}
+
+// collectCommitStats reads /sys/fs/btrfs/<uuid>/commit_stats (no subprocess).
+// last_commit_ms is only emitted once per scraper per new commit to avoid
+// stale values appearing as current in dashboards.
 func (c *BtrfsCollector) collectCommitStats(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
 	path := fmt.Sprintf("/sys/fs/btrfs/%s/commit_stats", fs.UUID)
 	f, err := os.Open(path)
@@ -488,24 +584,59 @@ func (c *BtrfsCollector) collectCommitStats(ch chan<- prometheus.Metric, fs btrf
 	}
 	defer f.Close()
 
-	descs := map[string]*prometheus.Desc{
-		"commits":          c.commitCommits,
-		"cur_commit_ms":    c.commitCurMs,
-		"last_commit_ms":   c.commitLastMs,
-		"max_commit_ms":    c.commitMaxMs,
-		"total_commit_ms":  c.commitTotalMs,
-	}
-
+	// Parse all values from sysfs (no lock needed)
+	vals := map[string]float64{}
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
-		if len(fields) != 2 {
-			continue
-		}
-		if desc, ok := descs[fields[0]]; ok {
+		if len(fields) == 2 {
 			val, _ := strconv.ParseFloat(fields[1], 64)
+			vals[fields[0]] = val
+		}
+	}
+
+	// Emit all metrics except last_commit_ms unconditionally
+	always := map[string]*prometheus.Desc{
+		"commits":         c.commitCommits,
+		"cur_commit_ms":   c.commitCurMs,
+		"max_commit_ms":   c.commitMaxMs,
+		"total_commit_ms": c.commitTotalMs,
+	}
+	for key, desc := range always {
+		if val, ok := vals[key]; ok {
 			ch <- prometheus.MustNewConstMetric(desc, prometheus.CounterValue, val, labels...)
 		}
+	}
+
+	// last_commit_ms: emit only once per scraper per new commit
+	lastMs, hasLast := vals["last_commit_ms"]
+	commits := vals["commits"]
+	if !hasLast {
+		return
+	}
+
+	c.commitMu.Lock()
+	scraper := c.currentScraper
+
+	state, exists := c.commitTracker[fs.UUID]
+	if !exists {
+		state = &commitState{reportedTo: map[string]bool{}}
+		c.commitTracker[fs.UUID] = state
+	}
+
+	if commits != state.lastSeenCommits {
+		state.lastSeenCommits = commits
+		state.reportedTo = map[string]bool{}
+	}
+
+	shouldEmit := !state.reportedTo[scraper]
+	if shouldEmit {
+		state.reportedTo[scraper] = true
+	}
+	c.commitMu.Unlock()
+
+	if shouldEmit {
+		ch <- prometheus.MustNewConstMetric(c.commitLastMs, prometheus.CounterValue, lastMs, labels...)
 	}
 }
 
