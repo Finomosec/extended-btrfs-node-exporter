@@ -78,6 +78,9 @@ type BtrfsCollector struct {
 	cleanOrphansLeft *prometheus.Desc
 	cleanOrphansMax  *prometheus.Desc
 
+	// Chunks
+	chunkCount *prometheus.Desc
+
 	// Device
 	deviceSizeBytes   *prometheus.Desc
 	deviceUnusedBytes *prometheus.Desc
@@ -155,6 +158,8 @@ func New(cfg Config) *BtrfsCollector {
 		beesTasksQueued:   prometheus.NewDesc("bees_tasks_queued", "Bees tasks queued", labels, nil),
 		beesWorkers:       prometheus.NewDesc("bees_thread_workers", "Bees worker threads", labels, nil),
 
+		chunkCount: prometheus.NewDesc("btrfs_chunk_count", "Number of chunks by type and device combination", append(labels, "profile", "devids"), nil),
+
 		deviceSizeBytes:   prometheus.NewDesc("btrfs_device_size_bytes", "Size of a device in the filesystem", append(deviceLabels, "btrfs_dev_uuid"), nil),
 		deviceUnusedBytes: prometheus.NewDesc("btrfs_device_unused_bytes", "Unused bytes on a device in the filesystem", append(deviceLabels, "btrfs_dev_uuid"), nil),
 		deviceErrorsTotal: prometheus.NewDesc("btrfs_device_errors_total", "Device errors by type", append(deviceLabels, "btrfs_dev_uuid", "type"), nil),
@@ -195,6 +200,7 @@ func (c *BtrfsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.beesTasksProgress
 	ch <- c.beesTasksQueued
 	ch <- c.beesWorkers
+	ch <- c.chunkCount
 	ch <- c.deviceSizeBytes
 	ch <- c.deviceUnusedBytes
 	ch <- c.deviceErrorsTotal
@@ -348,6 +354,9 @@ func (c *BtrfsCollector) collectFS(ch chan<- prometheus.Metric, fs btrfsFS) {
 	if c.cfg.CollectScrub {
 		c.collectScrub(ch, fs, labels)
 	}
+	if c.cfg.CollectChunks {
+		c.collectChunks(ch, fs, labels)
+	}
 	// Device metrics are always collected (like filesystem-level metrics)
 	c.collectDevices(ch, fs, labels)
 }
@@ -408,6 +417,34 @@ func (c *BtrfsCollector) collectDevices(ch chan<- prometheus.Metric, fs btrfsFS,
 			errType := strings.TrimSuffix(fields[0], "_errs")
 			ch <- prometheus.MustNewConstMetric(c.deviceErrorsTotal, prometheus.CounterValue, val, append(devLabels, errType)...)
 		}
+	}
+}
+
+// collectChunks reads chunk allocation via ioctl and emits per-profile/devid-combo counts
+func (c *BtrfsCollector) collectChunks(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
+	chunks, err := ListChunks(fs.fd, fs.Mountpoint, c.cfg.IoctlTimeout)
+	if err != nil {
+		log.Printf("[%s] ListChunks: %v", fs.Mountpoint, err)
+		return
+	}
+
+	// Count chunks per (profile, devids) combination
+	type chunkKey struct {
+		profile string
+		devids  string
+	}
+	counts := map[chunkKey]float64{}
+	for _, ci := range chunks {
+		devStrs := make([]string, len(ci.DevIDs))
+		for i, d := range ci.DevIDs {
+			devStrs[i] = fmt.Sprintf("%d", d)
+		}
+		k := chunkKey{profile: ci.Profile, devids: strings.Join(devStrs, ",")}
+		counts[k]++
+	}
+
+	for k, count := range counts {
+		ch <- prometheus.MustNewConstMetric(c.chunkCount, prometheus.GaugeValue, count, append(labels, k.profile, k.devids)...)
 	}
 }
 

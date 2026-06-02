@@ -40,6 +40,7 @@ var (
 // Key types
 const (
 	orphanItemKey  = 48
+	chunkItemKey   = 228
 	rootItemKey    = 132
 	rootBackrefKey = 144
 	qgroupInfoKey  = 242
@@ -48,6 +49,7 @@ const (
 // Object IDs
 const (
 	rootTreeObjectID    = 1
+	chunkTreeObjectID   = 3
 	quotaTreeObjectID   = 8
 	orphanObjectID      = uint64(0xFFFFFFFFFFFFFFFB) // -5 as uint64
 	fsTreeObjectID      = 5
@@ -656,4 +658,163 @@ func DevIDMap(fd int, mountpoint string, uuid string) map[string]string {
 	}
 
 	return result
+}
+
+// Chunk type flags (from btrfs_tree.h)
+const (
+	btrfsBlockGroupData     = 1 << 0
+	btrfsBlockGroupSystem   = 1 << 1
+	btrfsBlockGroupMetadata = 1 << 2
+	btrfsBlockGroupRAID0    = 1 << 3
+	btrfsBlockGroupRAID1    = 1 << 4
+	btrfsBlockGroupDUP      = 1 << 5
+	btrfsBlockGroupRAID10   = 1 << 6
+	btrfsBlockGroupRAID5    = 1 << 7
+	btrfsBlockGroupRAID6    = 1 << 8
+	btrfsBlockGroupRAID1C3  = 1 << 9
+	btrfsBlockGroupRAID1C4  = 1 << 10
+)
+
+// ChunkInfo represents one chunk's type and device assignment
+type ChunkInfo struct {
+	Profile string   // e.g. "DATA|RAID0", "METADATA|RAID1", "DATA|single"
+	DevIDs  []uint64 // sorted list of device IDs
+}
+
+func chunkProfileString(typeFlags uint64) string {
+	var parts []string
+	if typeFlags&btrfsBlockGroupData != 0 {
+		parts = append(parts, "DATA")
+	}
+	if typeFlags&btrfsBlockGroupMetadata != 0 {
+		parts = append(parts, "METADATA")
+	}
+	if typeFlags&btrfsBlockGroupSystem != 0 {
+		parts = append(parts, "SYSTEM")
+	}
+
+	dataType := "single"
+	switch {
+	case typeFlags&btrfsBlockGroupRAID0 != 0:
+		dataType = "RAID0"
+	case typeFlags&btrfsBlockGroupRAID1 != 0:
+		dataType = "RAID1"
+	case typeFlags&btrfsBlockGroupDUP != 0:
+		dataType = "DUP"
+	case typeFlags&btrfsBlockGroupRAID10 != 0:
+		dataType = "RAID10"
+	case typeFlags&btrfsBlockGroupRAID5 != 0:
+		dataType = "RAID5"
+	case typeFlags&btrfsBlockGroupRAID6 != 0:
+		dataType = "RAID6"
+	case typeFlags&btrfsBlockGroupRAID1C3 != 0:
+		dataType = "RAID1C3"
+	case typeFlags&btrfsBlockGroupRAID1C4 != 0:
+		dataType = "RAID1C4"
+	}
+
+	if len(parts) == 0 {
+		return dataType
+	}
+	return strings.Join(parts, "+") + "|" + dataType
+}
+
+// ListChunks reads the chunk tree via BTRFS_IOC_TREE_SEARCH and returns all chunk allocations
+func ListChunks(fd int, mountpoint string, timeout time.Duration) ([]ChunkInfo, error) {
+	return withTimeout(mountpoint+":chunks", timeout, func() ([]ChunkInfo, error) {
+		return listChunksImpl(fd)
+	})
+}
+
+func listChunksImpl(fd int) ([]ChunkInfo, error) {
+	var result []ChunkInfo
+	var args searchArgs
+
+	args.Key.TreeID = chunkTreeObjectID
+	args.Key.MinObjectID = 256 // BTRFS_FIRST_CHUNK_TREE_OBJECTID
+	args.Key.MaxObjectID = ^uint64(0)
+	args.Key.MinType = chunkItemKey
+	args.Key.MaxType = chunkItemKey
+	args.Key.MinOffset = 0
+	args.Key.MaxOffset = ^uint64(0)
+	args.Key.MinTransID = 0
+	args.Key.MaxTransID = ^uint64(0)
+
+	for {
+		args.Key.NrItems = 4096
+		nr, err := doTreeSearch(uintptr(fd), &args)
+		if err != nil {
+			return result, fmt.Errorf("chunk tree search: %w", err)
+		}
+		if nr == 0 {
+			break
+		}
+
+		offset := 0
+		for i := uint32(0); i < nr; i++ {
+			if offset+int(unsafe.Sizeof(searchHeader{})) > len(args.Buf) {
+				break
+			}
+			hdr := (*searchHeader)(unsafe.Pointer(&args.Buf[offset]))
+			offset += int(unsafe.Sizeof(searchHeader{}))
+
+			if hdr.Type != chunkItemKey {
+				offset += int(hdr.Len)
+				continue
+			}
+
+			if offset+48 > len(args.Buf) {
+				break
+			}
+
+			// Parse btrfs_chunk header (48 bytes):
+			// u64 length, u64 owner, u64 stripe_len, u64 type,
+			// u32 io_align, u32 io_width, u32 sector_size,
+			// u16 num_stripes, u16 sub_stripes
+			chunkType := binary.LittleEndian.Uint64(args.Buf[offset+24 : offset+32])
+			numStripes := binary.LittleEndian.Uint16(args.Buf[offset+44 : offset+46])
+
+			// Parse stripe devids (each stripe is 32 bytes: u64 devid, u64 offset, 16 byte uuid)
+			devIDs := make([]uint64, 0, numStripes)
+			stripeBase := offset + 48 // after chunk header, first stripe starts
+			for s := uint16(0); s < numStripes; s++ {
+				sOff := stripeBase + int(s)*32
+				if sOff+8 > len(args.Buf) {
+					break
+				}
+				devID := binary.LittleEndian.Uint64(args.Buf[sOff : sOff+8])
+				devIDs = append(devIDs, devID)
+			}
+
+			// Sort devIDs for consistent grouping
+			sortUint64s(devIDs)
+
+			result = append(result, ChunkInfo{
+				Profile: chunkProfileString(chunkType),
+				DevIDs:  devIDs,
+			})
+
+			offset += int(hdr.Len)
+
+			// Advance search cursor
+			args.Key.MinObjectID = hdr.ObjectID
+			args.Key.MinType = hdr.Type
+			args.Key.MinOffset = hdr.Offset + 1
+			if args.Key.MinOffset == 0 { // overflow
+				args.Key.MinType = hdr.Type + 1
+				if args.Key.MinType == 0 {
+					args.Key.MinObjectID = hdr.ObjectID + 1
+				}
+			}
+		}
+	}
+	return result, nil
+}
+
+func sortUint64s(a []uint64) {
+	for i := 1; i < len(a); i++ {
+		for j := i; j > 0 && a[j] < a[j-1]; j-- {
+			a[j], a[j-1] = a[j-1], a[j]
+		}
+	}
 }
