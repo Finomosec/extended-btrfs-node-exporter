@@ -136,6 +136,7 @@ All configuration is via environment variables (or `/etc/default/extended-btrfs-
 | `PORT` | `9198` | HTTP listen port |
 | `RESOLVE_DEVICE_MAPPER` | `false` | Resolve `dm-X` to `/dev/mapper/*` names in labels |
 | `BEES_STATUS_DIR` | `/run/bees` | Directory for bees status files |
+| `BEES_STALE_AFTER_SECS` | `30` | Skip bees metrics if the status file is older than this (daemon stopped) |
 | `IOCTL_TIMEOUT_SECS` | `30` | Timeout for ioctl calls (protects against kernel lock contention) |
 | `DEBUG` | `false` | Enable verbose debug logging |
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -823,9 +824,18 @@ func (c *BtrfsCollector) collectBalance(ch chan<- prometheus.Metric, fs btrfsFS,
 // collectBees reads bees status from /run/bees/<uuid>.status
 func (c *BtrfsCollector) collectBees(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
 	statusFile := filepath.Join(c.cfg.BeesStatusDir, fs.UUID+".status")
-	data, err := os.ReadFile(statusFile)
+	st, err := os.Stat(statusFile)
 	if err != nil {
 		return // bees not running for this FS
+	}
+	// bees schreibt die Datei sekündlich. Nach dem Stoppen bleibt sie bis zum Reboot
+	// in /run liegen — ohne diese Prüfung lieferte der Exporter eingefrorene Werte.
+	if time.Since(st.ModTime()) > c.cfg.BeesStaleAfter {
+		return
+	}
+	data, err := os.ReadFile(statusFile)
+	if err != nil {
+		return
 	}
 
 	content := string(data)

@@ -12,6 +12,9 @@ type Config struct {
 	ExcludeUUIDs  []string
 	BeesStatusDir string
 
+	// Ab welchem Alter der .status-Datei bees als gestoppt gilt
+	BeesStaleAfter time.Duration
+
 	// Subvolume name filters
 	IncludeSubvolumes []string // empty = all
 	ExcludeSubvolumes []string
@@ -42,6 +45,7 @@ type Config struct {
 func LoadConfig() Config {
 	cfg := Config{
 		BeesStatusDir:     "/run/bees",
+		BeesStaleAfter:    envDuration("BEES_STALE_AFTER_SECS", 30),
 		ResolveDeviceMapper: envBool("RESOLVE_DEVICE_MAPPER", false),
 		IoctlTimeout:       envDuration("IOCTL_TIMEOUT_SECS", 30),
 		Debug:              envBool("DEBUG", false),
