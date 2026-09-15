@@ -800,9 +800,22 @@ func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS,
 
 
 // collectBalance uses BTRFS_IOC_BALANCE_PROGRESS (no subprocess)
+// balanceStates lists every value GetBalanceStatus can report, so an idle
+// filesystem can emit an explicit 0 for each of them instead of dropping the
+// series — a vanishing series leaves the last non-zero value as the newest
+// sample, which reads as "still running" in dashboards and alerts.
+var balanceStates = []string{"running", "pausing", "canceling"}
+
 func (c *BtrfsCollector) collectBalance(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
 	status, err := GetBalanceStatus(fs.fd, fs.Mountpoint, c.cfg.IoctlTimeout)
-	if err != nil || status == nil || !status.Running {
+	if err != nil || status == nil {
+		// Unreadable status stays silent: reporting 0 here would be
+		// indistinguishable from "no balance running".
+		c.debugf("[%s] balance status unavailable: %v", fs.Mountpoint, err)
+		return
+	}
+	if !status.Running {
+		c.emitBalance(ch, labels, 0, 0, 0, 0, "")
 		return
 	}
 
@@ -814,11 +827,26 @@ func (c *BtrfsCollector) collectBalance(ch chan<- prometheus.Metric, fs btrfsFS,
 		progress = done / total * 100
 	}
 
+	c.emitBalance(ch, labels, done, total, considered, progress, status.State)
+}
+
+func (c *BtrfsCollector) emitBalance(ch chan<- prometheus.Metric, labels []string, done, total, considered, progress float64, state string) {
 	ch <- prometheus.MustNewConstMetric(c.balanceChunksDone, prometheus.GaugeValue, done, labels...)
 	ch <- prometheus.MustNewConstMetric(c.balanceChunksTotal, prometheus.GaugeValue, total, labels...)
 	ch <- prometheus.MustNewConstMetric(c.balanceChunksConsidered, prometheus.GaugeValue, considered, labels...)
 	ch <- prometheus.MustNewConstMetric(c.balanceProgressPercent, prometheus.GaugeValue, progress, labels...)
-	ch <- prometheus.MustNewConstMetric(c.balanceStatus, prometheus.GaugeValue, 1, append(labels, status.State)...)
+
+	for _, s := range balanceStates {
+		value := 0.0
+		if s == state {
+			value = 1
+		}
+		// Fresh slice per iteration: append(labels, ...) would reuse one
+		// backing array and overwrite the label of the previous metric.
+		stateLabels := make([]string, len(labels), len(labels)+1)
+		copy(stateLabels, labels)
+		ch <- prometheus.MustNewConstMetric(c.balanceStatus, prometheus.GaugeValue, value, append(stateLabels, s)...)
+	}
 }
 
 // collectBees reads bees status from /run/bees/<uuid>.status
