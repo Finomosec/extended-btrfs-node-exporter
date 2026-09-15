@@ -116,6 +116,28 @@ curl http://localhost:9198/metrics | head -20
 | `btrfs_clean_orphans_left_to_clean` | gauge | uuid, mountpoint | Orphan subvolumes pending cleanup |
 | `btrfs_clean_orphans_max_to_clean` | gauge | uuid, mountpoint | Peak orphan count seen |
 
+### bcache mapping (module: `COLLECT_BCACHE`)
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `btrfs_device_bcache_info` | gauge | uuid, mountpoint, device, backing_device, bcache, disk | Always `1`; maps a btrfs device to the bcache backing device below it |
+
+The node_exporter bcache collector labels its metrics with `backing_device="bdevN"`
+and nothing else. `bdevN` is the attach order within a cache set and matches
+neither the `bcacheN` device numbering nor the disk order, so those metrics
+cannot be attributed to a filesystem on their own. This metric supplies the
+missing link:
+
+```promql
+node_bcache_bypassed_bytes_total
+  * on(backing_device) group_left(mountpoint, device, disk)
+    btrfs_device_bcache_info
+```
+
+Emitted only for btrfs devices that sit on top of bcache. Hosts without bcache,
+or filesystems on plain devices, simply produce no series — the slave chain
+below each btrfs device is walked in sysfs, and anything unreadable is skipped.
+
 ### Bees dedup metrics (module: `COLLECT_BEES`)
 
 | Metric | Type | Labels | Description |
@@ -168,6 +190,7 @@ All configuration is via environment variables (or `/etc/default/extended-btrfs-
 | `COLLECT_DEFRAG` | `true` | Collect defrag process detection |
 | `COLLECT_BEES` | `true` | Collect bees dedup stats |
 | `COLLECT_ORPHANS` | `true` | Collect orphan subvolume counts |
+| `COLLECT_BCACHE` | `true` | Map btrfs devices to their bcache backing devices |
 
 ## Data Sources
 

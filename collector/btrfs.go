@@ -86,6 +86,7 @@ type BtrfsCollector struct {
 	deviceSizeBytes   *prometheus.Desc
 	deviceUnusedBytes *prometheus.Desc
 	deviceErrorsTotal *prometheus.Desc
+	deviceBcacheInfo  *prometheus.Desc
 
 	// Bees
 	beesCounter       *prometheus.Desc
@@ -164,6 +165,7 @@ func New(cfg Config) *BtrfsCollector {
 		deviceSizeBytes:   prometheus.NewDesc("btrfs_device_size_bytes", "Size of a device in the filesystem", append(deviceLabels, "btrfs_dev_uuid"), nil),
 		deviceUnusedBytes: prometheus.NewDesc("btrfs_device_unused_bytes", "Unused bytes on a device in the filesystem", append(deviceLabels, "btrfs_dev_uuid"), nil),
 		deviceErrorsTotal: prometheus.NewDesc("btrfs_device_errors_total", "Device errors by type", append(deviceLabels, "btrfs_dev_uuid", "type"), nil),
+		deviceBcacheInfo:  prometheus.NewDesc("btrfs_device_bcache_info", "Maps a btrfs device to the bcache backing device below it, joinable with node_bcache_* on backing_device", append(deviceLabels, "backing_device", "bcache", "disk"), nil),
 
 		commitTracker: map[string]*commitState{},
 	}
@@ -205,6 +207,7 @@ func (c *BtrfsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.deviceSizeBytes
 	ch <- c.deviceUnusedBytes
 	ch <- c.deviceErrorsTotal
+	ch <- c.deviceBcacheInfo
 }
 
 func (c *BtrfsCollector) Collect(ch chan<- prometheus.Metric) {
@@ -371,14 +374,33 @@ func (c *BtrfsCollector) collectDevices(ch chan<- prometheus.Metric, fs btrfsFS,
 		return
 	}
 
+	var bcacheIdx map[string]bcacheBdev
+	if c.cfg.CollectBcache && bcacheAvailable() {
+		bcacheIdx = bcacheIndex()
+		if len(bcacheIdx) == 0 {
+			c.debugf("[%s] bcache sysfs present but no backing devices found", fs.Mountpoint)
+		}
+	}
+
 	for _, di := range devinfos {
 		devID := di.Name()
 		deviceName := devMap[devID]
 		if deviceName == "" {
 			deviceName = "dev-" + devID
 		}
+		// The sysfs lookups below need the kernel name, which resolveDeviceName replaces.
+		sysfsName := deviceName
 		if c.cfg.ResolveDeviceMapper && deviceName != "missing" {
 			deviceName = c.resolveDeviceName(deviceName)
+		}
+
+		// Emitted before the ioctl below: the mapping is pure sysfs and stays
+		// available even when the ioctl is unavailable or fails.
+		if bcacheIdx != nil && sysfsName != "missing" {
+			if info, ok := bcacheForDevice(sysfsName, bcacheIdx); ok {
+				ch <- prometheus.MustNewConstMetric(c.deviceBcacheInfo, prometheus.GaugeValue, 1,
+					append(labels, deviceName, info.BackingDevice, info.Bcache, info.Disk)...)
+			}
 		}
 
 		// Device info from ioctl (size + UUID)

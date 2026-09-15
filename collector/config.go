@@ -40,6 +40,7 @@ type Config struct {
 	CollectBees       bool
 	CollectOrphans    bool
 	CollectChunks     bool
+	CollectBcache     bool
 }
 
 func LoadConfig() Config {
@@ -60,6 +61,7 @@ func LoadConfig() Config {
 		CollectBees:       envBool("COLLECT_BEES", true),
 		CollectOrphans:    envBool("COLLECT_ORPHANS", true),
 		CollectChunks:     envBool("COLLECT_CHUNKS", true),
+		CollectBcache:     envBool("COLLECT_BCACHE", true),
 	}
 
 	if v := os.Getenv("BTRFS_INCLUDE_UUIDS"); v != "" {
