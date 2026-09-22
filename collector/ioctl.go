@@ -811,6 +811,86 @@ func listChunksImpl(fd int) ([]ChunkInfo, error) {
 	return result, nil
 }
 
+// --- Dev Extents ---
+
+const (
+	devTreeObjectID = 4
+	devExtentKey    = 204
+	// Largest possible dev extent (data chunks are capped at 10 GiB)
+	maxDevExtentLen = uint64(10) << 30
+)
+
+// DevExtentsBeyond counts the dev extents of devid that end beyond limit,
+// i.e. what a shrink to limit still has to relocate.
+func DevExtentsBeyond(fd int, mountpoint string, timeout time.Duration, devid, limit uint64) (count, bytes uint64, err error) {
+	type result struct{ count, bytes uint64 }
+	r, err := withTimeout(fmt.Sprintf("%s:devextents:%d", mountpoint, devid), timeout, func() (result, error) {
+		c, b, err := devExtentsBeyondImpl(fd, devid, limit)
+		return result{c, b}, err
+	})
+	return r.count, r.bytes, err
+}
+
+func devExtentsBeyondImpl(fd int, devid, limit uint64) (uint64, uint64, error) {
+	var count, bytes uint64
+	var args searchArgs
+
+	// Extents are keyed by physical offset; only those starting less than one
+	// maximal extent below the limit can reach past it.
+	start := uint64(0)
+	if limit > maxDevExtentLen {
+		start = limit - maxDevExtentLen
+	}
+
+	args.Key.TreeID = devTreeObjectID
+	args.Key.MinObjectID = devid
+	args.Key.MaxObjectID = devid
+	args.Key.MinType = devExtentKey
+	args.Key.MaxType = devExtentKey
+	args.Key.MinOffset = start
+	args.Key.MaxOffset = ^uint64(0)
+	args.Key.MinTransID = 0
+	args.Key.MaxTransID = ^uint64(0)
+
+	for {
+		args.Key.NrItems = 4096
+		nr, err := doTreeSearch(uintptr(fd), &args)
+		if err != nil {
+			return count, bytes, fmt.Errorf("dev tree search: %w", err)
+		}
+		if nr == 0 {
+			break
+		}
+
+		offset := 0
+		var last *searchHeader
+		for i := uint32(0); i < nr; i++ {
+			if offset+int(unsafe.Sizeof(searchHeader{})) > len(args.Buf) {
+				break
+			}
+			hdr := (*searchHeader)(unsafe.Pointer(&args.Buf[offset]))
+			offset += int(unsafe.Sizeof(searchHeader{}))
+			last = hdr
+
+			// btrfs_dev_extent: u64 chunk_tree, u64 chunk_objectid, u64 chunk_offset, u64 length
+			if hdr.Type == devExtentKey && hdr.ObjectID == devid && offset+32 <= len(args.Buf) {
+				length := binary.LittleEndian.Uint64(args.Buf[offset+24 : offset+32])
+				if hdr.Offset+length > limit {
+					count++
+					bytes += length
+				}
+			}
+			offset += int(hdr.Len)
+		}
+
+		if last == nil || last.Offset == ^uint64(0) {
+			break
+		}
+		args.Key.MinOffset = last.Offset + 1
+	}
+	return count, bytes, nil
+}
+
 func sortUint64s(a []uint64) {
 	for i := 1; i < len(a); i++ {
 		for j := i; j > 0 && a[j] < a[j-1]; j-- {

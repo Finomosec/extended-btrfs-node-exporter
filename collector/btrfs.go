@@ -88,6 +88,14 @@ type BtrfsCollector struct {
 	deviceErrorsTotal *prometheus.Desc
 	deviceBcacheInfo  *prometheus.Desc
 
+	// Resize (shrink) progress
+	resizeChunksRemaining *prometheus.Desc
+	resizeBytesRemaining  *prometheus.Desc
+	resizeBytesTotal      *prometheus.Desc
+	resizeProgressPercent *prometheus.Desc
+	resizeMu              sync.Mutex
+	resizeTotals          map[string]uint64 // "<uuid>/<devid>" → remaining bytes when first seen
+
 	// Bees
 	beesCounter       *prometheus.Desc
 	beesTasksProgress *prometheus.Desc
@@ -167,6 +175,12 @@ func New(cfg Config) *BtrfsCollector {
 		deviceErrorsTotal: prometheus.NewDesc("btrfs_device_errors_total", "Device errors by type", append(deviceLabels, "btrfs_dev_uuid", "type"), nil),
 		deviceBcacheInfo:  prometheus.NewDesc("btrfs_device_bcache_info", "Maps a btrfs device to the bcache backing device below it, joinable with node_bcache_* on backing_device", append(deviceLabels, "backing_device", "bcache", "disk"), nil),
 
+		resizeChunksRemaining: prometheus.NewDesc("btrfs_resize_chunks_remaining", "Dev extents beyond the device size that a running shrink still has to relocate", append(deviceLabels, "btrfs_dev_uuid"), nil),
+		resizeBytesRemaining:  prometheus.NewDesc("btrfs_resize_bytes_remaining", "Bytes of dev extents beyond the device size that a running shrink still has to relocate", append(deviceLabels, "btrfs_dev_uuid"), nil),
+		resizeBytesTotal:      prometheus.NewDesc("btrfs_resize_bytes_total", "Bytes to relocate when the exporter first saw the running shrink", append(deviceLabels, "btrfs_dev_uuid"), nil),
+		resizeProgressPercent: prometheus.NewDesc("btrfs_resize_progress_percent", "Shrink progress percent, relative to btrfs_resize_bytes_total", append(deviceLabels, "btrfs_dev_uuid"), nil),
+		resizeTotals:          map[string]uint64{},
+
 		commitTracker: map[string]*commitState{},
 	}
 }
@@ -208,6 +222,10 @@ func (c *BtrfsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.deviceUnusedBytes
 	ch <- c.deviceErrorsTotal
 	ch <- c.deviceBcacheInfo
+	ch <- c.resizeChunksRemaining
+	ch <- c.resizeBytesRemaining
+	ch <- c.resizeBytesTotal
+	ch <- c.resizeProgressPercent
 }
 
 func (c *BtrfsCollector) Collect(ch chan<- prometheus.Metric) {
@@ -374,6 +392,11 @@ func (c *BtrfsCollector) collectDevices(ch chan<- prometheus.Metric, fs btrfsFS,
 		return
 	}
 
+	resizing := readExclusiveOp(fs.UUID) == "resize"
+	if !resizing {
+		c.resetResizeTotals(fs.UUID)
+	}
+
 	var bcacheIdx map[string]bcacheBdev
 	if c.cfg.CollectBcache && bcacheAvailable() {
 		bcacheIdx = bcacheIndex()
@@ -422,8 +445,14 @@ func (c *BtrfsCollector) collectDevices(ch chan<- prometheus.Metric, fs btrfsFS,
 
 		if args.TotalBytes > 0 {
 			ch <- prometheus.MustNewConstMetric(c.deviceSizeBytes, prometheus.GaugeValue, float64(args.TotalBytes), devLabels...)
-			unused := args.TotalBytes - args.BytesUsed
+			// Signed: during a shrink the size is already reduced while the
+			// extents beyond it are still allocated, so used can exceed size.
+			unused := int64(args.TotalBytes) - int64(args.BytesUsed)
 			ch <- prometheus.MustNewConstMetric(c.deviceUnusedBytes, prometheus.GaugeValue, float64(unused), devLabels...)
+
+			if resizing {
+				c.emitResizeProgress(ch, fs, devLabels, did, args.TotalBytes)
+			}
 		}
 
 		// Error stats from sysfs
@@ -439,6 +468,43 @@ func (c *BtrfsCollector) collectDevices(ch chan<- prometheus.Metric, fs btrfsFS,
 			val, _ := strconv.ParseFloat(fields[1], 64)
 			errType := strings.TrimSuffix(fields[0], "_errs")
 			ch <- prometheus.MustNewConstMetric(c.deviceErrorsTotal, prometheus.CounterValue, val, append(devLabels, errType)...)
+		}
+	}
+}
+
+// emitResizeProgress reports what a running shrink still has to move off the device.
+// The total is the remaining amount when first seen, so an exporter restart mid-shrink
+// restarts the percentage from the current state.
+func (c *BtrfsCollector) emitResizeProgress(ch chan<- prometheus.Metric, fs btrfsFS, devLabels []string, devid, size uint64) {
+	count, bytes, err := DevExtentsBeyond(fs.fd, fs.Mountpoint, c.cfg.IoctlTimeout, devid, size)
+	if err != nil {
+		log.Printf("[%s] DevExtentsBeyond(%d): %v", fs.Mountpoint, devid, err)
+		return
+	}
+
+	key := fmt.Sprintf("%s/%d", fs.UUID, devid)
+	c.resizeMu.Lock()
+	total, ok := c.resizeTotals[key]
+	if !ok || bytes > total {
+		total = bytes
+		c.resizeTotals[key] = total
+	}
+	c.resizeMu.Unlock()
+
+	ch <- prometheus.MustNewConstMetric(c.resizeChunksRemaining, prometheus.GaugeValue, float64(count), devLabels...)
+	ch <- prometheus.MustNewConstMetric(c.resizeBytesRemaining, prometheus.GaugeValue, float64(bytes), devLabels...)
+	ch <- prometheus.MustNewConstMetric(c.resizeBytesTotal, prometheus.GaugeValue, float64(total), devLabels...)
+	if total > 0 {
+		ch <- prometheus.MustNewConstMetric(c.resizeProgressPercent, prometheus.GaugeValue, float64(total-bytes)/float64(total)*100, devLabels...)
+	}
+}
+
+func (c *BtrfsCollector) resetResizeTotals(uuid string) {
+	c.resizeMu.Lock()
+	defer c.resizeMu.Unlock()
+	for k := range c.resizeTotals {
+		if strings.HasPrefix(k, uuid+"/") {
+			delete(c.resizeTotals, k)
 		}
 	}
 }

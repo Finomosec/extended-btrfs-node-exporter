@@ -103,6 +103,17 @@ curl http://localhost:9198/metrics | head -20
 | `btrfs_balance_progress_percent` | gauge | uuid, mountpoint | Balance progress percent |
 | `btrfs_balance_status` | gauge | uuid, mountpoint, status | Balance status (running/paused/pausing) |
 
+### Resize metrics (only while `btrfs_exclusive_operation{name="resize"}`)
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `btrfs_resize_chunks_remaining` | gauge | uuid, mountpoint, device, btrfs_dev_uuid | Dev extents beyond the device size a shrink still has to relocate |
+| `btrfs_resize_bytes_remaining` | gauge | uuid, mountpoint, device, btrfs_dev_uuid | Bytes of those dev extents |
+| `btrfs_resize_bytes_total` | gauge | uuid, mountpoint, device, btrfs_dev_uuid | Remaining bytes when the exporter first saw the shrink |
+| `btrfs_resize_progress_percent` | gauge | uuid, mountpoint, device, btrfs_dev_uuid | Progress relative to `btrfs_resize_bytes_total` |
+
+`btrfs_device_unused_bytes` is signed and goes negative while a shrink is running — the device size is already reduced while the extents beyond it are still allocated.
+
 ### Defrag metrics (module: `COLLECT_DEFRAG`)
 
 | Metric | Type | Labels | Description |
@@ -208,6 +219,7 @@ The exporter reads from these sources (no external scripts required):
 | Orphan count | `BTRFS_IOC_TREE_SEARCH` (orphan items) | ioctl |
 | Subvolume list | `BTRFS_IOC_TREE_SEARCH` (root tree) | ioctl |
 | Qgroup data | `BTRFS_IOC_TREE_SEARCH` (quota tree) | ioctl |
+| Resize progress | `BTRFS_IOC_TREE_SEARCH` (dev tree, extents past the device size) | ioctl |
 | Replace status | `BTRFS_IOC_DEV_REPLACE` | ioctl |
 | Balance status | `BTRFS_IOC_BALANCE_PROGRESS` | ioctl |
 | Quota rescan | `BTRFS_IOC_QUOTA_RESCAN_STATUS` | ioctl |
