@@ -103,7 +103,9 @@ curl http://localhost:9198/metrics | head -20
 | `btrfs_balance_progress_percent` | gauge | uuid, mountpoint | Balance progress percent |
 | `btrfs_balance_status` | gauge | uuid, mountpoint, status | Balance status (running/paused/pausing) |
 
-### Resize metrics (only while `btrfs_exclusive_operation{name="resize"}`)
+### Resize metrics (only while `btrfs_exclusive_operation{name="resize"}` or `{name="device remove"}`)
+
+A device remove shrinks the device to size 0, so its remaining bytes are everything still allocated on it.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|

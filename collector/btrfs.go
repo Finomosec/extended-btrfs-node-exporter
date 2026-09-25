@@ -392,7 +392,9 @@ func (c *BtrfsCollector) collectDevices(ch chan<- prometheus.Metric, fs btrfsFS,
 		return
 	}
 
-	resizing := readExclusiveOp(fs.UUID) == "resize"
+	// A device remove shrinks the device to size 0 and relocates the same way.
+	op := readExclusiveOp(fs.UUID)
+	resizing := op == "resize" || op == "device remove"
 	if !resizing {
 		c.resetResizeTotals(fs.UUID)
 	}
@@ -443,16 +445,15 @@ func (c *BtrfsCollector) collectDevices(ch chan<- prometheus.Metric, fs btrfsFS,
 
 		devLabels := append(labels, deviceName, devUUID)
 
-		if args.TotalBytes > 0 {
-			ch <- prometheus.MustNewConstMetric(c.deviceSizeBytes, prometheus.GaugeValue, float64(args.TotalBytes), devLabels...)
-			// Signed: during a shrink the size is already reduced while the
-			// extents beyond it are still allocated, so used can exceed size.
-			unused := int64(args.TotalBytes) - int64(args.BytesUsed)
-			ch <- prometheus.MustNewConstMetric(c.deviceUnusedBytes, prometheus.GaugeValue, float64(unused), devLabels...)
+		// Size 0 is reported too: a device being removed has its size set to 0.
+		ch <- prometheus.MustNewConstMetric(c.deviceSizeBytes, prometheus.GaugeValue, float64(args.TotalBytes), devLabels...)
+		// Signed: during a shrink the size is already reduced while the
+		// extents beyond it are still allocated, so used can exceed size.
+		unused := int64(args.TotalBytes) - int64(args.BytesUsed)
+		ch <- prometheus.MustNewConstMetric(c.deviceUnusedBytes, prometheus.GaugeValue, float64(unused), devLabels...)
 
-			if resizing {
-				c.emitResizeProgress(ch, fs, devLabels, did, args.TotalBytes)
-			}
+		if resizing {
+			c.emitResizeProgress(ch, fs, devLabels, did, args.TotalBytes)
 		}
 
 		// Error stats from sysfs
