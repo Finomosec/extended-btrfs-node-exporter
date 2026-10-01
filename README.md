@@ -72,7 +72,15 @@ curl http://localhost:9198/metrics | head -20
 | `btrfs_subvolume_exclusive_bytes` | gauge | uuid, mountpoint, subvolume, subvolume_id | Subvolume exclusive bytes |
 | `btrfs_subvolume_disk_usage` | gauge | uuid, mountpoint, subvolume, subvolume_id | Subvolume disk usage (= exclusive bytes) |
 | `btrfs_quota_rescan_running` | gauge | uuid, mountpoint | Whether quota rescan is active |
-| `btrfs_quota_rescan_current_key` | counter | uuid, mountpoint | Quota rescan progress key |
+| `btrfs_quota_rescan_current_key` | gauge | uuid, mountpoint | Logical address the quota rescan has reached |
+| `btrfs_quota_rescan_bytes_done` | gauge | uuid, mountpoint | Allocated chunk bytes below that address |
+| `btrfs_quota_rescan_bytes_total` | gauge | uuid, mountpoint | Allocated chunk bytes the rescan walks |
+| `btrfs_quota_rescan_progress_percent` | gauge | uuid, mountpoint | Rescan progress, `bytes_done / bytes_total` |
+
+The rescan walks the extent tree in logical address order. Logical space has gaps
+(balance relocates chunks to new, higher addresses), so the progress is the share of
+allocated chunk bytes below the current address, not the address over the highest one.
+All rescan metrics are 0 while no rescan runs.
 
 ### Commit metrics (module: `COLLECT_COMMIT`)
 
@@ -89,9 +97,13 @@ curl http://localhost:9198/metrics | head -20
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `btrfs_replace_progress_percent` | gauge | uuid, mountpoint, target_device, missing_devid | Device replace progress |
-| `btrfs_replace_write_errors_total` | counter | uuid, mountpoint, target_device, missing_devid | Replace write errors |
-| `btrfs_replace_read_errors_total` | counter | uuid, mountpoint, target_device, missing_devid | Replace uncorrectable read errors |
+| `btrfs_replace_status` | gauge | uuid, mountpoint, status | Replace state, one series per `never_started`/`started`/`finished`/`canceled`/`suspended`, always emitted |
+| `btrfs_replace_progress_percent` | gauge | uuid, mountpoint, old_device, new_device | Device replace progress |
+| `btrfs_replace_write_errors_total` | counter | uuid, mountpoint, old_device, new_device | Replace write errors |
+| `btrfs_replace_read_errors_total` | counter | uuid, mountpoint, old_device, new_device | Replace uncorrectable read errors |
+
+Progress and error metrics are emitted while the replace is `started` or `suspended` —
+a replace interrupted by an unmount or reboot is suspended and resumes on the next mount.
 
 ### Balance metrics (module: `COLLECT_BALANCE`)
 
@@ -101,7 +113,31 @@ curl http://localhost:9198/metrics | head -20
 | `btrfs_balance_chunks_total` | gauge | uuid, mountpoint | Balance chunks total |
 | `btrfs_balance_chunks_considered` | gauge | uuid, mountpoint | Balance chunks considered |
 | `btrfs_balance_progress_percent` | gauge | uuid, mountpoint | Balance progress percent |
-| `btrfs_balance_status` | gauge | uuid, mountpoint, status | Balance status (running/paused/pausing) |
+| `btrfs_balance_status` | gauge | uuid, mountpoint, status | Balance status, one series per `running`/`paused`/`pausing`/`canceling` |
+
+A paused balance — after `btrfs balance pause`, or after a reboot, where a balance
+always resumes paused — keeps reporting its chunk counts and progress.
+
+### Scrub metrics (module: `COLLECT_SCRUB`)
+
+Per device; `device` is the btrfs devid. Live values come from `BTRFS_IOC_SCRUB_PROGRESS`
+while a scrub runs, otherwise from the btrfs-progs status file.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `btrfs_scrub_status` | gauge | uuid, mountpoint, device, status | One series per `running`/`finished`/`canceled`/`interrupted`/`idle` |
+| `btrfs_scrub_bytes_scrubbed` | gauge | uuid, mountpoint, device | Data + tree bytes scrubbed |
+| `btrfs_scrub_total_bytes` | gauge | uuid, mountpoint, device | Bytes to scrub: allocated bytes on the device, or the scrubbed bytes once finished (as btrfs-progs) |
+| `btrfs_scrub_progress_percent` | gauge | uuid, mountpoint, device | `bytes_scrubbed / total_bytes` |
+| `btrfs_scrub_duration_seconds` | gauge | uuid, mountpoint, device | Elapsed scrub time |
+| `btrfs_scrub_rate_bytes_per_second` | gauge | uuid, mountpoint, device | Average rate over the scrub |
+| `btrfs_scrub_seconds_left` | gauge | uuid, mountpoint, device | Estimated time left, 0 unless running |
+| `btrfs_scrub_last_physical_bytes` | gauge | uuid, mountpoint, device | Physical offset on the device the scrub has reached |
+| `btrfs_scrub_errors` | gauge | uuid, mountpoint, device, type | Errors of the last scrub by type (`read_errors`, `csum_errors`, `verify_errors`, `super_errors`, `uncorrectable_errors`, `corrected_errors`) |
+
+`interrupted` is a scrub that neither finished nor was canceled and no longer runs —
+typically cut off by a reboot. The status file alone looks identical to a running scrub;
+the ioctl tells them apart.
 
 ### Resize metrics (only while `btrfs_exclusive_operation{name="resize"}` or `{name="device remove"}`)
 
@@ -120,7 +156,11 @@ A device remove shrinks the device to size 0, so its remaining bytes are everyth
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `btrfs_defrag_running` | gauge | uuid, mountpoint | Number of defrag processes running |
+| `btrfs_defrag_running` | gauge | uuid, mountpoint | Number of `btrfs filesystem defragment` processes targeting this filesystem |
+
+Each target path is resolved against the process cwd and assigned to the btrfs mount with
+the longest matching prefix; abbreviated commands such as `btrfs fi defrag` are recognized.
+The kernel exposes no defrag progress, so there is no percentage.
 
 ### Orphan metrics (module: `COLLECT_ORPHANS`)
 
@@ -128,6 +168,7 @@ A device remove shrinks the device to size 0, so its remaining bytes are everyth
 |--------|------|--------|-------------|
 | `btrfs_clean_orphans_left_to_clean` | gauge | uuid, mountpoint | Orphan subvolumes pending cleanup |
 | `btrfs_clean_orphans_max_to_clean` | gauge | uuid, mountpoint | Peak orphan count seen |
+| `btrfs_clean_orphans_progress_percent` | gauge | uuid, mountpoint | Cleanup progress relative to the peak, 0 when nothing is pending |
 
 ### bcache mapping (module: `COLLECT_BCACHE`)
 
@@ -222,6 +263,7 @@ The exporter reads from these sources (no external scripts required):
 | Subvolume list | `BTRFS_IOC_TREE_SEARCH` (root tree) | ioctl |
 | Qgroup data | `BTRFS_IOC_TREE_SEARCH` (quota tree) | ioctl |
 | Resize progress | `BTRFS_IOC_TREE_SEARCH` (dev tree, extents past the device size) | ioctl |
+| Scrub status | `/var/lib/btrfs/scrub.status.<uuid>` + `BTRFS_IOC_SCRUB_PROGRESS` | File read + ioctl |
 | Replace status | `BTRFS_IOC_DEV_REPLACE` | ioctl |
 | Balance status | `BTRFS_IOC_BALANCE_PROGRESS` | ioctl |
 | Quota rescan | `BTRFS_IOC_QUOTA_RESCAN_STATUS` | ioctl |

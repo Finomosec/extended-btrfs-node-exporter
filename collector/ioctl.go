@@ -32,6 +32,7 @@ func ior(typ, nr, size uintptr) uintptr  { return ioc(iocRead, typ, nr, size) }
 var (
 	iocTreeSearch        = iowr(btrfsMagic, 17, 4096)
 	iocDevInfo           = iowr(btrfsMagic, 30, unsafe.Sizeof(devInfoArgs{}))
+	iocScrubProgress     = iowr(btrfsMagic, 29, unsafe.Sizeof(scrubArgs{}))
 	iocBalanceProgress   = ior(btrfsMagic, 34, unsafe.Sizeof(balanceArgs{}))
 	iocQuotaRescanStatus = ior(btrfsMagic, 45, unsafe.Sizeof(quotaRescanArgs{}))
 	iocDevReplace        = iowr(btrfsMagic, 53, 2600) // sizeof(struct btrfs_ioctl_dev_replace_args)
@@ -434,8 +435,12 @@ type devReplaceArgs struct {
 
 const devReplaceCmdStatus = 1
 
+// replaceStates are the BTRFS_IOCTL_DEV_REPLACE_STATE_* values, indexed by number.
+var replaceStates = []string{"never_started", "started", "finished", "canceled", "suspended"}
+
 type ReplaceStatus struct {
 	Running   bool
+	State     string
 	Progress  float64
 	WriteErrs uint64
 	ReadErrs  uint64
@@ -464,7 +469,7 @@ func getReplaceStatusImpl(fd int, mountpoint string) (*ReplaceStatus, error) {
 
 	// Status params start at offset 16 (after cmd + result)
 	status := (*devReplaceStatusParams)(unsafe.Pointer(uintptr(unsafe.Pointer(&args)) + 16))
-	if status.ReplaceState == 0 { // NEVER_STARTED
+	if status.ReplaceState >= uint64(len(replaceStates)) {
 		return nil, nil
 	}
 
@@ -472,6 +477,7 @@ func getReplaceStatusImpl(fd int, mountpoint string) (*ReplaceStatus, error) {
 	// not populated by STATUS cmd. Device names are resolved via sysfs in collectReplace.
 	return &ReplaceStatus{
 		Running:   status.ReplaceState == 1,
+		State:     replaceStates[status.ReplaceState],
 		Progress:  float64(status.Progress1000) / 10.0,
 		WriteErrs: status.NumWriteErrs,
 		ReadErrs:  status.NumReadErrs,
@@ -542,7 +548,12 @@ func getBalanceStatusImpl(fd int, mountpoint string) (*BalanceStatus, error) {
 		return &BalanceStatus{Running: false}, nil
 	}
 
-	state := "running"
+	// A paused balance still answers the ioctl, just without the running bit
+	// (e.g. after a reboot, where a balance always resumes paused).
+	state := "paused"
+	if args.State&balanceStateRunning != 0 {
+		state = "running"
+	}
 	if args.State&balanceStatePauseReq != 0 {
 		state = "pausing"
 	}
@@ -593,7 +604,75 @@ func getQuotaRescanStatusImpl(fd int, mountpoint string) (*QuotaRescanStatus, er
 	}, nil
 }
 
+// --- Scrub Progress ---
+
+// scrubProgress mirrors struct btrfs_scrub_progress (15 × u64).
+type scrubProgress struct {
+	DataExtentsScrubbed uint64
+	TreeExtentsScrubbed uint64
+	DataBytesScrubbed   uint64
+	TreeBytesScrubbed   uint64
+	ReadErrors          uint64
+	CsumErrors          uint64
+	VerifyErrors        uint64
+	NoCsum              uint64
+	CsumDiscards        uint64
+	SuperErrors         uint64
+	MallocErrors        uint64
+	UncorrectableErrors uint64
+	CorrectedErrors     uint64
+	LastPhysical        uint64
+	UnverifiedErrors    uint64
+}
+
+type scrubArgs struct {
+	DevID    uint64
+	Start    uint64
+	End      uint64
+	Flags    uint64
+	Progress scrubProgress
+	Unused   [(1024 - 32 - 120) / 8]uint64
+} // 1024 bytes total
+
+type ScrubProgress struct {
+	Running bool
+	scrubProgress
+}
+
+// GetScrubProgress queries the live progress of a scrub on one device.
+// Running is false when no scrub runs there (ENOTCONN), which is also how an
+// interrupted scrub — status file left without finished/canceled — is told apart.
+func GetScrubProgress(fd int, mountpoint string, timeout time.Duration, devid uint64) (*ScrubProgress, error) {
+	return withTimeout(fmt.Sprintf("%s:scrub:%d", mountpoint, devid), timeout, func() (*ScrubProgress, error) {
+		return getScrubProgressImpl(fd, devid)
+	})
+}
+
+func getScrubProgressImpl(fd int, devid uint64) (*ScrubProgress, error) {
+	var args scrubArgs
+	args.DevID = devid
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), iocScrubProgress, uintptr(unsafe.Pointer(&args)))
+	if errno == syscall.ENOTCONN {
+		return &ScrubProgress{Running: false}, nil
+	}
+	if errno != 0 {
+		return nil, errno
+	}
+	return &ScrubProgress{Running: true, scrubProgress: args.Progress}, nil
+}
+
 // --- Dev Info + DevID Map ---
+
+// GetDevInfo queries size and allocation of one device via BTRFS_IOC_DEV_INFO.
+func GetDevInfo(fd int, devid uint64) (*devInfoArgs, error) {
+	var args devInfoArgs
+	args.DevID = devid
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), iocDevInfo, uintptr(unsafe.Pointer(&args)))
+	if errno != 0 {
+		return nil, errno
+	}
+	return &args, nil
+}
 
 type devInfoArgs struct {
 	DevID      uint64
@@ -679,6 +758,8 @@ const (
 type ChunkInfo struct {
 	Profile string   // e.g. "DATA|RAID0", "METADATA|RAID1", "DATA|single"
 	DevIDs  []uint64 // sorted list of device IDs
+	Logical uint64   // logical start address (chunk item key offset)
+	Length  uint64   // logical length
 }
 
 func chunkProfileString(typeFlags uint64) string {
@@ -771,6 +852,7 @@ func listChunksImpl(fd int) ([]ChunkInfo, error) {
 			// u64 length, u64 owner, u64 stripe_len, u64 type,
 			// u32 io_align, u32 io_width, u32 sector_size,
 			// u16 num_stripes, u16 sub_stripes
+			chunkLength := binary.LittleEndian.Uint64(args.Buf[offset : offset+8])
 			chunkType := binary.LittleEndian.Uint64(args.Buf[offset+24 : offset+32])
 			numStripes := binary.LittleEndian.Uint16(args.Buf[offset+44 : offset+46])
 
@@ -792,6 +874,8 @@ func listChunksImpl(fd int) ([]ChunkInfo, error) {
 			result = append(result, ChunkInfo{
 				Profile: chunkProfileString(chunkType),
 				DevIDs:  devIDs,
+				Logical: hdr.Offset,
+				Length:  chunkLength,
 			})
 
 			offset += int(hdr.Len)

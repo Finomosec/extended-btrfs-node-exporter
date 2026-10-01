@@ -53,11 +53,15 @@ type BtrfsCollector struct {
 	defragRunning     *prometheus.Desc
 	quotaRescanRunning *prometheus.Desc
 	quotaRescanKey     *prometheus.Desc
+	quotaRescanDone    *prometheus.Desc
+	quotaRescanTotal   *prometheus.Desc
+	quotaRescanPercent *prometheus.Desc
 
 	// Replace
 	replaceProgress   *prometheus.Desc
 	replaceWriteErrs  *prometheus.Desc
 	replaceReadErrs   *prometheus.Desc
+	replaceStatus     *prometheus.Desc
 
 	// Balance
 	balanceChunksDone      *prometheus.Desc
@@ -72,12 +76,15 @@ type BtrfsCollector struct {
 	scrubTotalBytes      *prometheus.Desc
 	scrubRateBps         *prometheus.Desc
 	scrubBytesScrubbed   *prometheus.Desc
+	scrubProgressPercent *prometheus.Desc
+	scrubLastPhysical    *prometheus.Desc
 	scrubStatus          *prometheus.Desc
 	scrubErrors          *prometheus.Desc
 
 	// Cleaner (orphans)
-	cleanOrphansLeft *prometheus.Desc
-	cleanOrphansMax  *prometheus.Desc
+	cleanOrphansLeft    *prometheus.Desc
+	cleanOrphansMax     *prometheus.Desc
+	cleanOrphansPercent *prometheus.Desc
 
 	// Chunks
 	chunkCount *prometheus.Desc
@@ -141,10 +148,14 @@ func New(cfg Config) *BtrfsCollector {
 		defragRunning:      prometheus.NewDesc("btrfs_defrag_running", "Number of defrag processes running", labels, nil),
 		quotaRescanRunning: prometheus.NewDesc("btrfs_quota_rescan_running", "Whether quota rescan is running", labels, nil),
 		quotaRescanKey:     prometheus.NewDesc("btrfs_quota_rescan_current_key", "Quota rescan current key", labels, nil),
+		quotaRescanDone:    prometheus.NewDesc("btrfs_quota_rescan_bytes_done", "Allocated chunk bytes below the quota rescan position", labels, nil),
+		quotaRescanTotal:   prometheus.NewDesc("btrfs_quota_rescan_bytes_total", "Allocated chunk bytes the quota rescan walks", labels, nil),
+		quotaRescanPercent: prometheus.NewDesc("btrfs_quota_rescan_progress_percent", "Quota rescan progress percent", labels, nil),
 
 		replaceProgress:  prometheus.NewDesc("btrfs_replace_progress_percent", "Device replace progress percent", append(labels, "old_device", "new_device"), nil),
 		replaceWriteErrs: prometheus.NewDesc("btrfs_replace_write_errors_total", "Device replace write errors", append(labels, "old_device", "new_device"), nil),
 		replaceReadErrs:  prometheus.NewDesc("btrfs_replace_read_errors_total", "Device replace uncorrectable read errors", append(labels, "old_device", "new_device"), nil),
+		replaceStatus:    prometheus.NewDesc("btrfs_replace_status", "Device replace state (never_started/started/finished/canceled/suspended)", append(labels, "status"), nil),
 
 		balanceChunksDone:       prometheus.NewDesc("btrfs_balance_chunks_done", "Balance chunks completed", labels, nil),
 		balanceChunksTotal:      prometheus.NewDesc("btrfs_balance_chunks_total", "Balance chunks total", labels, nil),
@@ -152,16 +163,19 @@ func New(cfg Config) *BtrfsCollector {
 		balanceProgressPercent:  prometheus.NewDesc("btrfs_balance_progress_percent", "Balance progress percent", labels, nil),
 		balanceStatus:           prometheus.NewDesc("btrfs_balance_status", "Balance status", append(labels, "status"), nil),
 
-		scrubDurationSecs:  prometheus.NewDesc("btrfs_scrub_duration_seconds", "Scrub duration in seconds", labels, nil),
-		scrubSecsLeft:      prometheus.NewDesc("btrfs_scrub_seconds_left", "Scrub estimated seconds left", labels, nil),
-		scrubTotalBytes:    prometheus.NewDesc("btrfs_scrub_total_bytes", "Scrub total bytes to process", labels, nil),
-		scrubRateBps:       prometheus.NewDesc("btrfs_scrub_rate_bytes_per_second", "Scrub rate in bytes per second", labels, nil),
-		scrubBytesScrubbed: prometheus.NewDesc("btrfs_scrub_bytes_scrubbed", "Scrub total bytes scrubbed", labels, nil),
-		scrubStatus:        prometheus.NewDesc("btrfs_scrub_status", "Scrub status per device", append(deviceLabels, "status"), nil),
-		scrubErrors:        prometheus.NewDesc("btrfs_scrub_errors", "Scrub errors per device per type", append(deviceLabels, "type"), nil),
+		scrubDurationSecs:    prometheus.NewDesc("btrfs_scrub_duration_seconds", "Scrub duration in seconds", deviceLabels, nil),
+		scrubSecsLeft:        prometheus.NewDesc("btrfs_scrub_seconds_left", "Scrub estimated seconds left (0 unless running)", deviceLabels, nil),
+		scrubTotalBytes:      prometheus.NewDesc("btrfs_scrub_total_bytes", "Scrub total bytes to process", deviceLabels, nil),
+		scrubRateBps:         prometheus.NewDesc("btrfs_scrub_rate_bytes_per_second", "Scrub rate in bytes per second", deviceLabels, nil),
+		scrubBytesScrubbed:   prometheus.NewDesc("btrfs_scrub_bytes_scrubbed", "Scrub total bytes scrubbed (data + tree)", deviceLabels, nil),
+		scrubProgressPercent: prometheus.NewDesc("btrfs_scrub_progress_percent", "Scrub progress percent, relative to btrfs_scrub_total_bytes", deviceLabels, nil),
+		scrubLastPhysical:    prometheus.NewDesc("btrfs_scrub_last_physical_bytes", "Physical device offset the scrub has reached", deviceLabels, nil),
+		scrubStatus:          prometheus.NewDesc("btrfs_scrub_status", "Scrub status per device", append(deviceLabels, "status"), nil),
+		scrubErrors:          prometheus.NewDesc("btrfs_scrub_errors", "Scrub errors per device per type, reset by every scrub", append(deviceLabels, "type"), nil),
 
-		cleanOrphansLeft: prometheus.NewDesc("btrfs_clean_orphans_left_to_clean", "Orphan subvolumes left to clean", labels, nil),
-		cleanOrphansMax:  prometheus.NewDesc("btrfs_clean_orphans_max_to_clean", "Max orphan subvolumes seen", labels, nil),
+		cleanOrphansLeft:    prometheus.NewDesc("btrfs_clean_orphans_left_to_clean", "Orphan subvolumes left to clean", labels, nil),
+		cleanOrphansMax:     prometheus.NewDesc("btrfs_clean_orphans_max_to_clean", "Max orphan subvolumes seen", labels, nil),
+		cleanOrphansPercent: prometheus.NewDesc("btrfs_clean_orphans_progress_percent", "Orphan cleanup progress percent, relative to btrfs_clean_orphans_max_to_clean", labels, nil),
 
 		beesCounter:       prometheus.NewDesc("bees_counter", "Bees dedup counter", append(labels, "name"), nil),
 		beesTasksProgress: prometheus.NewDesc("bees_tasks_in_progress", "Bees tasks in progress", labels, nil),
@@ -209,11 +223,30 @@ func (c *BtrfsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.defragRunning
 	ch <- c.quotaRescanRunning
 	ch <- c.quotaRescanKey
+	ch <- c.quotaRescanDone
+	ch <- c.quotaRescanTotal
+	ch <- c.quotaRescanPercent
 	ch <- c.replaceProgress
 	ch <- c.replaceWriteErrs
 	ch <- c.replaceReadErrs
+	ch <- c.replaceStatus
+	ch <- c.balanceChunksDone
+	ch <- c.balanceChunksTotal
+	ch <- c.balanceChunksConsidered
+	ch <- c.balanceProgressPercent
+	ch <- c.balanceStatus
+	ch <- c.scrubDurationSecs
+	ch <- c.scrubSecsLeft
+	ch <- c.scrubTotalBytes
+	ch <- c.scrubRateBps
+	ch <- c.scrubBytesScrubbed
+	ch <- c.scrubProgressPercent
+	ch <- c.scrubLastPhysical
+	ch <- c.scrubStatus
+	ch <- c.scrubErrors
 	ch <- c.cleanOrphansLeft
 	ch <- c.cleanOrphansMax
+	ch <- c.cleanOrphansPercent
 	ch <- c.beesTasksProgress
 	ch <- c.beesTasksQueued
 	ch <- c.beesWorkers
@@ -578,20 +611,63 @@ func (c *BtrfsCollector) collectScrub(ch chan<- prometheus.Metric, fs btrfsFS, l
 			}
 		}
 
-		// Determine status
+		devid, err := strconv.ParseUint(diskID, 10, 64)
+		if err != nil {
+			continue
+		}
+		num := func(key string) float64 {
+			v, _ := strconv.ParseFloat(vals[key], 64)
+			return v
+		}
+
+		// The status file alone cannot tell a running scrub from one cut off by a
+		// reboot — both lack finished/canceled. The ioctl answers only while it runs.
+		started := vals["t_start"] != "" && vals["t_start"] != "0"
+		live, err := GetScrubProgress(fs.fd, fs.Mountpoint, c.cfg.IoctlTimeout, devid)
+		running := err == nil && live.Running
+		if err != nil {
+			c.debugf("[%s] scrub progress devid %d: %v", fs.Mountpoint, devid, err)
+			running = started && vals["finished"] != "1" && vals["canceled"] != "1"
+		}
+
 		status := "idle"
-		if vals["finished"] == "1" {
-			status = "finished"
-		} else if vals["canceled"] == "1" {
-			status = "canceled"
-		} else if vals["t_start"] != "" && vals["t_start"] != "0" && vals["finished"] != "1" && vals["canceled"] != "1" {
+		switch {
+		case running:
 			status = "running"
+		case vals["finished"] == "1":
+			status = "finished"
+		case vals["canceled"] == "1":
+			status = "canceled"
+		case started:
+			status = "interrupted"
+		}
+
+		counters := map[string]float64{}
+		for _, key := range []string{"data_bytes_scrubbed", "tree_bytes_scrubbed", "last_physical",
+			"read_errors", "csum_errors", "verify_errors", "super_errors", "uncorrectable_errors", "corrected_errors"} {
+			counters[key] = num(key)
+		}
+		duration := num("duration")
+		if running && live != nil && live.Running {
+			p := live.scrubProgress
+			counters["data_bytes_scrubbed"] = float64(p.DataBytesScrubbed)
+			counters["tree_bytes_scrubbed"] = float64(p.TreeBytesScrubbed)
+			counters["last_physical"] = float64(p.LastPhysical)
+			counters["read_errors"] = float64(p.ReadErrors)
+			counters["csum_errors"] = float64(p.CsumErrors)
+			counters["verify_errors"] = float64(p.VerifyErrors)
+			counters["super_errors"] = float64(p.SuperErrors)
+			counters["uncorrectable_errors"] = float64(p.UncorrectableErrors)
+			counters["corrected_errors"] = float64(p.CorrectedErrors)
+			// btrfs-progs computes the live duration the same way
+			if start := num("t_start"); start > 0 {
+				duration = float64(time.Now().Unix()) - start
+			}
 		}
 
 		deviceLabels := []string{fs.UUID, fs.Mountpoint, diskID}
 
-		// Status per device
-		for _, st := range []string{"running", "finished", "canceled", "idle"} {
+		for _, st := range scrubStates {
 			val := 0.0
 			if st == status {
 				val = 1.0
@@ -600,18 +676,47 @@ func (c *BtrfsCollector) collectScrub(ch chan<- prometheus.Metric, fs btrfsFS, l
 				append(deviceLabels, st)...)
 		}
 
-		// Error counters per device
-		errorTypes := []string{"read_errors", "csum_errors", "verify_errors", "super_errors",
-			"uncorrectable_errors", "corrected_errors", "last_physical"}
-		for _, et := range errorTypes {
-			if v, ok := vals[et]; ok {
-				val, _ := strconv.ParseFloat(v, 64)
-				ch <- prometheus.MustNewConstMetric(c.scrubErrors, prometheus.CounterValue, val,
-					append(deviceLabels, et)...)
+		// Gauges, not counters: every scrub starts them from 0 again.
+		for _, et := range []string{"read_errors", "csum_errors", "verify_errors", "super_errors",
+			"uncorrectable_errors", "corrected_errors"} {
+			ch <- prometheus.MustNewConstMetric(c.scrubErrors, prometheus.GaugeValue, counters[et],
+				append(deviceLabels, et)...)
+		}
+
+		// Same reference as btrfs-progs: a finished scrub is measured against what
+		// it scrubbed, anything else against the bytes allocated on the device.
+		scrubbed := counters["data_bytes_scrubbed"] + counters["tree_bytes_scrubbed"]
+		total := scrubbed
+		if status != "finished" {
+			if di, err := GetDevInfo(fs.fd, devid); err == nil {
+				total = float64(di.BytesUsed)
 			}
 		}
+		rate, percent, secsLeft := 0.0, 0.0, 0.0
+		if duration > 0 {
+			rate = scrubbed / duration
+		}
+		if total > 0 {
+			percent = min(scrubbed/total*100, 100)
+		}
+		if running && rate > 0 && total > scrubbed {
+			secsLeft = (total - scrubbed) / rate
+		}
+
+		ch <- prometheus.MustNewConstMetric(c.scrubBytesScrubbed, prometheus.GaugeValue, scrubbed, deviceLabels...)
+		ch <- prometheus.MustNewConstMetric(c.scrubTotalBytes, prometheus.GaugeValue, total, deviceLabels...)
+		ch <- prometheus.MustNewConstMetric(c.scrubProgressPercent, prometheus.GaugeValue, percent, deviceLabels...)
+		ch <- prometheus.MustNewConstMetric(c.scrubDurationSecs, prometheus.GaugeValue, duration, deviceLabels...)
+		ch <- prometheus.MustNewConstMetric(c.scrubRateBps, prometheus.GaugeValue, rate, deviceLabels...)
+		ch <- prometheus.MustNewConstMetric(c.scrubSecsLeft, prometheus.GaugeValue, secsLeft, deviceLabels...)
+		ch <- prometheus.MustNewConstMetric(c.scrubLastPhysical, prometheus.GaugeValue, counters["last_physical"], deviceLabels...)
 	}
 }
+
+// scrubStates lists every status collectScrub reports, each with an explicit 0/1.
+// "interrupted" is a scrub that neither finished nor was canceled and no longer
+// runs — typically cut off by a reboot.
+var scrubStates = []string{"running", "finished", "canceled", "interrupted", "idle"}
 
 // readExclusiveOp reads the current exclusive operation from sysfs (never blocks)
 func readExclusiveOp(uuid string) string {
@@ -805,50 +910,168 @@ func (c *BtrfsCollector) collectExclusiveOp(ch chan<- prometheus.Metric, fs btrf
 	ch <- prometheus.MustNewConstMetric(c.exclusiveOp, prometheus.GaugeValue, 1, append(labels, name)...)
 }
 
-// collectDefrag checks for running defrag processes (via /proc)
+// collectDefrag counts running `btrfs filesystem defragment` processes (via /proc)
+// whose target paths lie on this filesystem. Each target is resolved against the
+// process cwd and mapped to its filesystem by the longest btrfs mountpoint prefix.
 func (c *BtrfsCollector) collectDefrag(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
 	count := 0
+	mounts := btrfsMounts()
 	entries, _ := os.ReadDir("/proc")
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		_, err := strconv.Atoi(entry.Name())
-		if err != nil {
+		if _, err := strconv.Atoi(entry.Name()); err != nil {
 			continue
 		}
 		cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
 		if err != nil {
 			continue
 		}
-		cmd := string(cmdline)
-		if strings.Contains(cmd, "btrfs") && strings.Contains(cmd, "defragment") && strings.Contains(cmd, fs.Mountpoint) {
-			count++
+		targets := defragTargets(strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00"))
+		if len(targets) == 0 {
+			continue
+		}
+		cwd, _ := os.Readlink(filepath.Join("/proc", entry.Name(), "cwd"))
+		for _, t := range targets {
+			if !filepath.IsAbs(t) {
+				t = filepath.Join(cwd, t)
+			}
+			if uuidForPath(filepath.Clean(t), mounts) == fs.UUID {
+				count++
+				break
+			}
 		}
 	}
 	ch <- prometheus.MustNewConstMetric(c.defragRunning, prometheus.GaugeValue, float64(count), labels...)
 }
 
+// defragTargets returns the paths of a `btrfs filesystem defragment` command
+// line, or nil for any other process. btrfs accepts unambiguous prefixes of its
+// subcommands, so `btrfs fi defrag` and `btrfs filesystem de` count as well.
+func defragTargets(args []string) []string {
+	if len(args) < 3 || filepath.Base(args[0]) != "btrfs" {
+		return nil
+	}
+	i := 1
+	for i < len(args) && strings.HasPrefix(args[i], "-") { // global options
+		i++
+	}
+	if i+1 >= len(args) || !isCmdPrefix(args[i], "filesystem") || !isCmdPrefix(args[i+1], "defragment") {
+		return nil
+	}
+	var targets []string
+	rest := args[i+2:]
+	for j := 0; j < len(rest); j++ {
+		a := rest[j]
+		if a == "--" {
+			return append(targets, rest[j+1:]...)
+		}
+		if strings.HasPrefix(a, "-") {
+			if a == "-t" || a == "-s" || a == "-l" { // options taking a separate value
+				j++
+			}
+			continue
+		}
+		targets = append(targets, a)
+	}
+	return targets
+}
+
+func isCmdPrefix(s, word string) bool {
+	return len(s) >= 2 && strings.HasPrefix(word, s)
+}
+
+// btrfsMounts maps every btrfs mountpoint (including subvolume mounts) to its UUID.
+func btrfsMounts() map[string]string {
+	data, err := os.ReadFile("/proc/self/mounts")
+	if err != nil {
+		return nil
+	}
+	mounts := map[string]string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[2] != "btrfs" {
+			continue
+		}
+		if uuid := uuidForDevice(fields[0]); uuid != "" {
+			mounts[unescapeOctal(fields[1])] = uuid
+		}
+	}
+	return mounts
+}
+
+// uuidForPath returns the UUID of the btrfs mount with the longest matching prefix.
+func uuidForPath(path string, mounts map[string]string) string {
+	best, uuid := -1, ""
+	for mp, u := range mounts {
+		if (path == mp || mp == "/" || strings.HasPrefix(path, mp+"/")) && len(mp) > best {
+			best, uuid = len(mp), u
+		}
+	}
+	return uuid
+}
+
 // collectQuotaRescan uses BTRFS_IOC_QUOTA_RESCAN_STATUS (no subprocess)
 func (c *BtrfsCollector) collectQuotaRescan(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
 	status, err := GetQuotaRescanStatus(fs.fd, fs.Mountpoint, c.cfg.IoctlTimeout)
-	if err != nil || status == nil {
-		ch <- prometheus.MustNewConstMetric(c.quotaRescanRunning, prometheus.GaugeValue, 0, labels...)
-		ch <- prometheus.MustNewConstMetric(c.quotaRescanKey, prometheus.CounterValue, 0, labels...)
+	if err != nil || status == nil || !status.Running {
+		c.emitQuotaRescan(ch, labels, 0, 0, 0, 0)
 		return
 	}
-	running := 0.0
-	if status.Running {
-		running = 1.0
+
+	// The rescan walks the extent tree in logical address order and reports the
+	// address it reached. Logical space has gaps (balance moves chunks upwards),
+	// so progress is the share of allocated chunk bytes below that address.
+	done, total := 0.0, 0.0
+	if chunks, err := ListChunks(fs.fd, fs.Mountpoint, c.cfg.IoctlTimeout); err == nil {
+		pos := status.Progress
+		for _, ci := range chunks {
+			total += float64(ci.Length)
+			switch {
+			case ci.Logical+ci.Length <= pos:
+				done += float64(ci.Length)
+			case ci.Logical < pos:
+				done += float64(pos - ci.Logical)
+			}
+		}
+	} else {
+		log.Printf("[%s] quota rescan ListChunks: %v", fs.Mountpoint, err)
+	}
+	c.emitQuotaRescan(ch, labels, 1, float64(status.Progress), done, total)
+}
+
+func (c *BtrfsCollector) emitQuotaRescan(ch chan<- prometheus.Metric, labels []string, running, key, done, total float64) {
+	percent := 0.0
+	if total > 0 {
+		percent = done / total * 100
 	}
 	ch <- prometheus.MustNewConstMetric(c.quotaRescanRunning, prometheus.GaugeValue, running, labels...)
-	ch <- prometheus.MustNewConstMetric(c.quotaRescanKey, prometheus.CounterValue, float64(status.Progress), labels...)
+	ch <- prometheus.MustNewConstMetric(c.quotaRescanKey, prometheus.GaugeValue, key, labels...)
+	ch <- prometheus.MustNewConstMetric(c.quotaRescanDone, prometheus.GaugeValue, done, labels...)
+	ch <- prometheus.MustNewConstMetric(c.quotaRescanTotal, prometheus.GaugeValue, total, labels...)
+	ch <- prometheus.MustNewConstMetric(c.quotaRescanPercent, prometheus.GaugeValue, percent, labels...)
 }
 
 // collectReplace uses BTRFS_IOC_DEV_REPLACE for status (no subprocess)
 func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
 	status, err := GetReplaceStatus(fs.fd, fs.Mountpoint, c.cfg.IoctlTimeout)
-	if err != nil || status == nil || !status.Running {
+	if err != nil || status == nil {
+		return
+	}
+	// Every state gets an explicit 0/1, like balance, so a finished replace
+	// does not linger as the last "started" sample.
+	for _, s := range replaceStates {
+		value := 0.0
+		if s == status.State {
+			value = 1
+		}
+		stateLabels := make([]string, len(labels), len(labels)+1)
+		copy(stateLabels, labels)
+		ch <- prometheus.MustNewConstMetric(c.replaceStatus, prometheus.GaugeValue, value, append(stateLabels, s)...)
+	}
+	// A suspended replace (interrupted by unmount/reboot) still has progress to show.
+	if !status.Running && status.State != "suspended" {
 		return
 	}
 
@@ -893,7 +1116,7 @@ func (c *BtrfsCollector) collectReplace(ch chan<- prometheus.Metric, fs btrfsFS,
 // filesystem can emit an explicit 0 for each of them instead of dropping the
 // series — a vanishing series leaves the last non-zero value as the newest
 // sample, which reads as "still running" in dashboards and alerts.
-var balanceStates = []string{"running", "pausing", "canceling"}
+var balanceStates = []string{"running", "paused", "pausing", "canceling"}
 
 func (c *BtrfsCollector) collectBalance(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
 	status, err := GetBalanceStatus(fs.fd, fs.Mountpoint, c.cfg.IoctlTimeout)
@@ -903,7 +1126,8 @@ func (c *BtrfsCollector) collectBalance(ch chan<- prometheus.Metric, fs btrfsFS,
 		c.debugf("[%s] balance status unavailable: %v", fs.Mountpoint, err)
 		return
 	}
-	if !status.Running {
+	// A paused balance keeps its progress, so it is reported like a running one.
+	if !status.Running && status.State != "paused" {
 		c.emitBalance(ch, labels, 0, 0, 0, 0, "")
 		return
 	}
@@ -996,6 +1220,7 @@ func (c *BtrfsCollector) collectOrphans(ch chan<- prometheus.Metric, fs btrfsFS,
 	if err != nil {
 		ch <- prometheus.MustNewConstMetric(c.cleanOrphansLeft, prometheus.GaugeValue, 0, labels...)
 		ch <- prometheus.MustNewConstMetric(c.cleanOrphansMax, prometheus.GaugeValue, 0, labels...)
+		ch <- prometheus.MustNewConstMetric(c.cleanOrphansPercent, prometheus.GaugeValue, 0, labels...)
 		return
 	}
 
@@ -1019,6 +1244,11 @@ func (c *BtrfsCollector) collectOrphans(ch chan<- prometheus.Metric, fs btrfsFS,
 
 	ch <- prometheus.MustNewConstMetric(c.cleanOrphansLeft, prometheus.GaugeValue, float64(count), labels...)
 	ch <- prometheus.MustNewConstMetric(c.cleanOrphansMax, prometheus.GaugeValue, float64(newMax), labels...)
+	percent := 0.0
+	if newMax > 0 {
+		percent = float64(newMax-count) / float64(newMax) * 100
+	}
+	ch <- prometheus.MustNewConstMetric(c.cleanOrphansPercent, prometheus.GaugeValue, percent, labels...)
 }
 
 // resolveDeviceName resolves dm-X to /dev/mapper/* if ResolveDeviceMapper is enabled
