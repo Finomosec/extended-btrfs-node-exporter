@@ -879,23 +879,29 @@ func (c *BtrfsCollector) collectCommitStats(ch chan<- prometheus.Metric, fs btrf
 
 // collectCommitRunning derives commit-in-progress from cur_commit_ms in sysfs.
 // cur_commit_ms > 0 means a commit is currently running on this filesystem.
+// Older kernels (e.g. 6.8) lack cur_commit_ms; the metric is omitted there
+// instead of reporting a misleading 0.
 func (c *BtrfsCollector) collectCommitRunning(ch chan<- prometheus.Metric, fs btrfsFS, labels []string) {
-	running := 0.0
 	path := fmt.Sprintf("/sys/fs/btrfs/%s/commit_stats", fs.UUID)
 	data, err := os.ReadFile(path)
-	if err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) == 2 && fields[0] == "cur_commit_ms" {
-				val, _ := strconv.ParseFloat(fields[1], 64)
-				if val > 0 {
-					running = 1.0
-				}
-				break
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "cur_commit_ms" {
+			val, err := strconv.ParseFloat(fields[1], 64)
+			if err != nil {
+				return
 			}
+			running := 0.0
+			if val > 0 {
+				running = 1.0
+			}
+			ch <- prometheus.MustNewConstMetric(c.commitRunning, prometheus.GaugeValue, running, labels...)
+			return
 		}
 	}
-	ch <- prometheus.MustNewConstMetric(c.commitRunning, prometheus.GaugeValue, running, labels...)
 }
 
 

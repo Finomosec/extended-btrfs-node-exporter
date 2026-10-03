@@ -91,7 +91,7 @@ All rescan metrics are 0 while no rescan runs.
 | `btrfs_commit_last_commit_ms` | counter | uuid, mountpoint | Last commit duration in ms |
 | `btrfs_commit_max_commit_ms` | counter | uuid, mountpoint | Max commit duration in ms |
 | `btrfs_commit_total_commit_ms` | counter | uuid, mountpoint | Total commit time in ms |
-| `btrfs_commit_running` | gauge | uuid, mountpoint | Whether a commit is in progress (D-state detection) |
+| `btrfs_commit_running` | gauge | uuid, mountpoint | Whether a commit is in progress (`cur_commit_ms > 0`) |
 
 ### Replace metrics (module: `COLLECT_REPLACE`)
 
@@ -272,7 +272,7 @@ The exporter reads from these sources (no external scripts required):
 ## Caveats
 
 - **Snapshot detection** uses `parent_uuid` from btrfs metadata. A subvolume created via `btrfs subvolume snapshot` will be classified as a snapshot. If you restore a snapshot by renaming it to replace the original subvolume, it will still be detected as a snapshot (`parent_uuid` remains set). This only affects `COLLECT_SNAPSHOTS` / `COLLECT_SUBVOLUMES` filtering — the metrics themselves are always accurate.
-- **`btrfs_commit_running`** detects D-state on btrfs-transaction kernel threads. PID-to-filesystem mapping is done natively via `/proc` starttime correlation with kernel log mount timestamps. Accuracy depends on kernel log not being rotated since boot.
+- **`btrfs_commit_cur_commit_ms` / `btrfs_commit_running`** need a kernel whose `commit_stats` contains `cur_commit_ms` (missing e.g. in 6.8). On older kernels both metrics are absent. Scrapes only rarely hit short commits; alert on `btrfs_commit_cur_commit_ms > bool 5000` to catch hanging ones.
 - **Root required** — the exporter must run as root to access btrfs ioctls, sysfs, and `/proc` data.
 
 ## License
