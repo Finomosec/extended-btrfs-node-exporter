@@ -87,7 +87,7 @@ All rescan metrics are 0 while no rescan runs.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `btrfs_commit_commits` | counter | uuid, mountpoint | Total number of commits |
-| `btrfs_commit_cur_commit_ms` | counter | uuid, mountpoint | Current commit duration in ms |
+| `btrfs_commit_cur_commit_ms` | gauge | uuid, mountpoint | Current commit duration in ms |
 | `btrfs_commit_last_commit_ms` | counter | uuid, mountpoint | Last commit duration in ms |
 | `btrfs_commit_max_commit_ms` | counter | uuid, mountpoint | Max commit duration in ms |
 | `btrfs_commit_total_commit_ms` | counter | uuid, mountpoint | Total commit time in ms |

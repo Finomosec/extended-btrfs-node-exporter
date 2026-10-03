@@ -835,7 +835,6 @@ func (c *BtrfsCollector) collectCommitStats(ch chan<- prometheus.Metric, fs btrf
 	// Emit all metrics except last_commit_ms unconditionally
 	always := map[string]*prometheus.Desc{
 		"commits":         c.commitCommits,
-		"cur_commit_ms":   c.commitCurMs,
 		"max_commit_ms":   c.commitMaxMs,
 		"total_commit_ms": c.commitTotalMs,
 	}
@@ -843,6 +842,9 @@ func (c *BtrfsCollector) collectCommitStats(ch chan<- prometheus.Metric, fs btrf
 		if val, ok := vals[key]; ok {
 			ch <- prometheus.MustNewConstMetric(desc, prometheus.CounterValue, val, labels...)
 		}
+	}
+	if val, ok := vals["cur_commit_ms"]; ok {
+		ch <- prometheus.MustNewConstMetric(c.commitCurMs, prometheus.GaugeValue, val, labels...)
 	}
 
 	// last_commit_ms: emit only once per scraper per new commit
